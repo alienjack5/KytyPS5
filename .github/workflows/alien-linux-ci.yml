@@ -95,8 +95,11 @@ jobs:
         run: |
           # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first errors as annotations.
           if [ -f build.log ]; then
-            grep -E 'error:|FAILED:|undefined reference|fatal' build.log | sort -u | head -n 40 |
-              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+            errors=$(grep -E 'error:|FAILED:|undefined reference|fatal' build.log | sort -u | head -n 40 || true)
+            if [ -z "$errors" ]; then
+              errors=$(tail -n 15 build.log)
+            fi
+            while IFS= read -r line; do echo "::error::${line//%/%25}"; done <<< "$errors"
           fi
 
       - name: Test
@@ -122,16 +125,21 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
               out.write(summary + "\n")
           EOF
-          ctest --test-dir _Build/ci --tests-from-file ci-tests.txt -j "$(nproc)" --timeout 600 \
-            --output-on-failure 2>&1 | tee test.log
+          # ctest reads the list relative to --test-dir, so the path is absolute.
+          ctest --test-dir _Build/ci --tests-from-file "$GITHUB_WORKSPACE/ci-tests.txt" -j "$(nproc)" \
+            --timeout 600 --output-on-failure 2>&1 | tee test.log
 
       - name: Show test failures
         if: failure()
         run: |
-          # The failing tests' output as annotations, so a failure can be read from the run summary.
+          # The failing tests as annotations, so a failure can be read without signing in; the end of
+          # the log when ctest stopped before listing any (an unreadable test list, a missing test).
           if [ -f test.log ]; then
-            sed -n '/The following tests FAILED/,$p' test.log | grep -E '^\s+[0-9]+ - ' |
-              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+            failed=$(sed -n '/The following tests FAILED/,$p' test.log | grep -E '^\s+[0-9]+ - ' || true)
+            if [ -z "$failed" ]; then
+              failed=$(tail -n 15 test.log)
+            fi
+            while IFS= read -r line; do echo "::error::${line//%/%25}"; done <<< "$failed"
           fi
 
       - name: Upload logs

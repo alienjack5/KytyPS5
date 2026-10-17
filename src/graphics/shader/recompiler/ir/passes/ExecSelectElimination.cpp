@@ -226,28 +226,50 @@ struct ExternalReferences {
 };
 
 ExternalReferences CollectExternalReferences(const Program& program) {
-	ExternalReferences       refs;
-	std::vector<const Inst*> pending;
-	const auto               freeze = [&](const Inst* inst) {
-        if (inst != nullptr && refs.frozen.insert(inst).second) {
-            pending.push_back(inst);
-        }
-	};
-	const auto freeze_value = [&](Value value) {
-		if (!value.IsEmpty()) {
-			freeze(value.Resolve().TryInstruction());
+	ExternalReferences refs;
+	// The plan holds plain Values, not uses, and CompileProgram runs EliminateDeadCode before this
+	// pass: an instruction only the plan names is erased with the rest of the dead code (a
+	// descriptor of a buffer whose loads all folded away still names the GetUserData of each
+	// dword). Such a Value points to freed memory, so only instructions the program still holds
+	// are followed, and each one is checked before it is read (Resolve() would read it).
+	size_t count = program.value_storage.size();
+	for (const auto* block: program.blocks) {
+		count += block->Instructions().size();
+	}
+	std::unordered_set<const Inst*> present(count);
+	for (const auto& inst: program.value_storage) {
+		present.insert(&inst);
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			present.insert(&inst);
+		}
+	}
+	const auto held = [&](Value value) -> const Inst* {
+		for (;;) {
+			const auto* inst = value.IsEmpty() ? nullptr : value.TryInstruction();
+			if (inst == nullptr || !present.contains(inst)) {
+				return nullptr;
+			}
+			if (inst->GetOpcode() != ValueOpcode::Identity) {
+				return inst;
+			}
+			value = inst->Arg(0);
 		}
 	};
-	const auto pin = [&](const Inst* inst) {
-		if (inst != nullptr) {
+	std::vector<const Inst*> pending;
+	const auto               freeze = [&](const Inst* inst) {
+		if (inst != nullptr && present.contains(inst) && refs.frozen.insert(inst).second) {
+			pending.push_back(inst);
+		}
+	};
+	const auto freeze_value = [&](Value value) { freeze(held(value)); };
+	const auto pin          = [&](const Inst* inst) {
+		if (inst != nullptr && present.contains(inst)) {
 			refs.pinned.insert(inst);
 		}
 	};
-	const auto pin_value = [&](Value value) {
-		if (!value.IsEmpty()) {
-			pin(value.Resolve().TryInstruction());
-		}
-	};
+	const auto pin_value = [&](Value value) { pin(held(value)); };
 	for (const auto& inst: program.value_storage) {
 		freeze(&inst);
 	}

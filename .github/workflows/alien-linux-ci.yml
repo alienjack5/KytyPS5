@@ -34,7 +34,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            git-core tar zstd gzip findutils which diffutils python3 ccache \
+            git-core tar zstd gzip findutils which diffutils python3 ccache glibc-gconv-extra \
             clang lld ninja-build cmake glslang pkgconf-pkg-config \
             mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
             libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
@@ -140,6 +140,24 @@ jobs:
               failed=$(tail -n 15 test.log)
             fi
             while IFS= read -r line; do echo "::error::${line//%/%25}"; done <<< "$failed"
+            # One more annotation per failing test: the end of its output (--output-on-failure).
+            python3 -I - test.log <<'EOF'
+          import re, sys
+          lines = open(sys.argv[1], errors="replace").read().splitlines()
+          current, blocks = None, {}
+          for line in lines:
+              result = re.match(r"\s*\d+/\d+ Test\s+#\d+: (\S+) \.+.*(Failed|Exception|Timeout|Not Run)", line)
+              if result:
+                  current = result.group(1)
+                  blocks[current] = []
+              elif re.match(r"\s*(\d+/\d+ Test\s+#|Start\s+\d+:|\d+% tests passed)", line) or line.startswith("The following tests FAILED"):
+                  current = None
+              elif current is not None and line.strip():
+                  blocks[current].append(line)
+          for name, output in blocks.items():
+              text = "%0A".join(l.replace("%", "%25") for l in output[-12:])
+              print(f"::error title={name} output::{text}")
+          EOF
           fi
 
       - name: Upload logs

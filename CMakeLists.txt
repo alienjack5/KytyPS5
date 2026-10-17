@@ -2508,6 +2508,20 @@ if(BUILD_TESTING)
 	)
 endif()
 
+# Linux: the userfaultfd write-tracking probes (KYTY_UFFD_WP, KYTY_UFFD_WP_ASYNC) against the running
+# kernel (common/platform/uffdWriteWatch.h).
+if(LINUX)
+	add_executable(uffd_write_watch_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/UffdWriteWatchTests.cpp")
+	target_link_libraries(uffd_write_watch_tests common)
+	target_include_directories(uffd_write_watch_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME uffd_write_watch COMMAND $<TARGET_FILE:uffd_write_watch_tests>)
+		set_tests_properties(uffd_write_watch PROPERTIES TIMEOUT 30
+			FAIL_REGULAR_EXPRESSION "Tests: failed: ")
+		add_dependencies(kyty_tests uffd_write_watch_tests)
+	endif()
+endif()
+
 # Test Darwin signal-context restoration for SSE4a instructions.
 if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))

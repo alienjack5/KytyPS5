@@ -817,6 +817,16 @@ add_executable(kyty_pipeline_list EXCLUDE_FROM_ALL
 target_link_libraries(kyty_pipeline_list xxhash libzstd_static nlohmann_json::nlohmann_json)
 target_include_directories(kyty_pipeline_list PRIVATE ${inc_headers})
 
+# fault_bench: the guest write-tracking microbenchmark (mprotect, userfaultfd write-protection, and
+# asynchronous write-protection with PAGEMAP_SCAN; tools/fault-bench/README.md). Linux only, built
+# on request only.
+if(LINUX)
+	find_package(Threads REQUIRED)
+	add_executable(fault_bench EXCLUDE_FROM_ALL
+		"${CMAKE_CURRENT_SOURCE_DIR}/tools/fault-bench/fault_bench.cpp")
+	target_link_libraries(fault_bench Threads::Threads)
+endif()
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})

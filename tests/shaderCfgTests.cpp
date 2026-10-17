@@ -1922,13 +1922,15 @@ void TestNativeStoreCompletion() {
   Check(source.find("OpControlBarrier") == std::string::npos &&
             source.find("OpMemoryBarrier") == std::string::npos,
         "other wait counters or VSCNT 63 became a store completion barrier");
-#ifndef _WIN32
+  // Partial and register-based counts wait for all stores (Translator::S_WAITCNT_VSCNT: waiting
+  // longer is always correct); upstream exits on them instead.
   for (const uint32_t word : {EncodeSopk(0x17, 125, 1), register_wait[0]}) {
-    const std::array unsupported = {word, EncodeSopp(0x01)};
-    ExpectFatal([&] { (void)RecompileForTest(unsupported, options); },
-                "unsupported partial or register-based store wait was dropped");
+    const std::array partial = {word, EncodeSopp(0x01)};
+    const auto result = RecompileForTest(partial, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(result.ir_dump.find("StoreCompletion") != std::string::npos,
+          "a partial or register-based store wait did not wait for all stores");
   }
-#endif
 }
 
 void TestSopkCompareImmediateExtension() {

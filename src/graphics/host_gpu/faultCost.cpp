@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/liveSwitch.h"
 #include "common/platform/uffdWriteWatch.h"
+#include "graphics/host_gpu/asyncWriteEstimate.h"
 
 #include <algorithm>
 #include <array>
@@ -1145,6 +1146,13 @@ void AdvanceFrame() noexcept {
 		            static_cast<double>(ucalls) / static_cast<double>(frames), avg(c.unprotect_ns - p.unprotect_ns, ucalls),
 		            ucalls != 0 ? static_cast<double>(c.unprotect_pages - p.unprotect_pages) / static_cast<double>(ucalls) : 0.0,
 		            model.fault_us, model.protect_call_us, model.tighten_fixed_us, SlowLevel());
+		if (AsyncWriteEstimate::Enabled()) {
+			const auto f = static_cast<double>(frames);
+			AsyncWriteEstimate::ReportPeriod(
+			    seconds, frames, static_cast<double>(c.fault_ns - p.fault_ns) / f / 1e6,
+			    static_cast<double>(c.protect_ns - p.protect_ns) / f / 1e6,
+			    static_cast<double>(c.unprotect_ns - p.unprotect_ns) / f / 1e6);
+		}
 		if (const auto reporter = g_periodic_reporter.load(std::memory_order_acquire); reporter != nullptr) {
 			reporter(seconds, frames);
 		}

@@ -59,6 +59,12 @@ bool AsyncRequested() {
 	return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// The estimator (graphics/host_gpu/asyncWriteEstimate.h) wants the self-test's scan cost.
+bool EstimateRequested() {
+	const auto* value = std::getenv("KYTY_UFFD_WP_ASYNC_ESTIMATE");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 void LogFailure(const char* what, uint64_t vaddr, uint64_t size, int error,
                 const char* fallback = "mprotect") {
 	g_failures.fetch_add(1, std::memory_order_relaxed);
@@ -436,9 +442,10 @@ void EnsureProbed() {
 		return;
 	}
 	Support s;
-	s.probed          = true;
-	s.requested       = Requested();
-	s.async_requested = AsyncRequested();
+	s.probed             = true;
+	s.requested          = Requested();
+	s.async_requested    = AsyncRequested();
+	s.estimate_requested = EstimateRequested();
 #if defined(KYTY_UFFD_WRITE_WATCH)
 	CloseDescriptors(g_support); // a previous probe's (Testing::Reprobe)
 	if (s.requested) {
@@ -450,14 +457,15 @@ void EnsureProbed() {
 		            s.error != 0 ? (std::string(", error: ") + std::strerror(s.error)).c_str() : "");
 		std::fflush(stdout);
 	}
-	if (s.async_requested) {
+	if (s.async_requested || s.estimate_requested) {
+		const char* setting =
+		    s.async_requested ? "KYTY_UFFD_WP_ASYNC=1" : "KYTY_UFFD_WP_ASYNC_ESTIMATE=1";
 		ProbeAsync(s);
 		if (s.async) {
 			std::printf(
-			    "Kyty platform: asynchronous userfaultfd write-protection (KYTY_UFFD_WP_ASYNC=1): "
-			    "available "
+			    "Kyty platform: asynchronous userfaultfd write-protection (%s): available "
 			    "(kernel features 0x%llx, %s descriptor, PAGEMAP_SCAN on /proc/self/pagemap)\n",
-			    static_cast<unsigned long long>(s.features),
+			    setting, static_cast<unsigned long long>(s.features),
 			    s.async_user_mode ? "user-mode-only" : "full");
 			RunAsyncSelfTest(s);
 			const auto& t = s.selftest;
@@ -487,13 +495,12 @@ void EnsureProbed() {
 				    t.huge_absent ? "yes" : "no");
 			}
 		} else {
-			std::printf("Kyty platform: asynchronous userfaultfd write-protection "
-			            "(KYTY_UFFD_WP_ASYNC=1): unavailable: "
-			            "%s (kernel features 0x%llx%s%s)\n",
-			            s.async_reason != nullptr ? s.async_reason : "unknown reason",
-			            static_cast<unsigned long long>(s.features),
-			            s.async_error != 0 ? ", error: " : "",
-			            s.async_error != 0 ? std::strerror(s.async_error) : "");
+			std::printf(
+			    "Kyty platform: asynchronous userfaultfd write-protection (%s): unavailable: "
+			    "%s (kernel features 0x%llx%s%s)\n",
+			    setting, s.async_reason != nullptr ? s.async_reason : "unknown reason",
+			    static_cast<unsigned long long>(s.features), s.async_error != 0 ? ", error: " : "",
+			    s.async_error != 0 ? std::strerror(s.async_error) : "");
 		}
 		std::fflush(stdout);
 	}

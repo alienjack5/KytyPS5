@@ -13,9 +13,9 @@
 
 ## 3. Cost estimator (gate, part 2, D9)
 
-- [ ] 3.1 Add the chunk and epoch bookkeeping (2 MiB chunks, epoch of the last collection) as standalone logic; verify with unit tests that a chunk is counted once per epoch and again after `SyncEpoch::Advance`
-- [ ] 3.2 Count, under `KYTY_UFFD_WP_ASYNC_ESTIMATE=1`, the chunks each D4 site would collect (buffer synchronization with its relaxed and memo checks, `RefreshImage`, `SynchronizeBdaBuffers`, GPU-dirty transitions, downloads), and add the estimated collections and time to the `KYTY_FAULT_COST_LOG` line next to the measured tracking cost; verify that `shader_recompiler_compute_tests` passes with the estimator on and that its log shows the fields
-- [ ] 3.3 Document the estimator and how to read its line in `docs/LINUX-U59.md`; verify that the documented commands run as written
+- [x] 3.1 Add the chunk and epoch bookkeeping (2 MiB chunks, epoch of the last collection) as standalone logic; verify with unit tests that a chunk is counted once per epoch and again after `SyncEpoch::Advance`
+- [x] 3.2 Count, under `KYTY_UFFD_WP_ASYNC_ESTIMATE=1`, the chunks each D4 site would collect (buffer synchronization with its relaxed and memo checks, `RefreshImage`, `SynchronizeBdaBuffers`, GPU-dirty transitions, downloads), and add the estimated collections and time to the `KYTY_FAULT_COST_LOG` line next to the measured tracking cost; verify that `shader_recompiler_compute_tests` passes with the estimator on and that its log shows the fields
+- [x] 3.3 Document the estimator and how to read its line in `docs/LINUX-U59.md`; verify that the documented commands run as written
 - [ ] 3.4 Run a game the user owns with the estimator, record the estimated and measured costs in `design.md`, and decide whether to continue; verify that the numbers and the decision are recorded
 
 ## 4. Registration and host protection (D2, D3)

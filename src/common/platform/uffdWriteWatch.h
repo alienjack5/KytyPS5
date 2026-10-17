@@ -73,6 +73,8 @@ struct Support {
 	int      fd            = -1;
 	// Asynchronous write-protection (KYTY_UFFD_WP_ASYNC=1).
 	bool          async_requested = false;   // KYTY_UFFD_WP_ASYNC=1 (exactly)
+	bool estimate_requested       = false; // KYTY_UFFD_WP_ASYNC_ESTIMATE=1: probed and self-tested
+	                                       // for the estimator's scan cost, never selected
 	bool          async           = false;   // the asynchronous descriptor and the pagemap are open
 	bool          async_user_mode = false;   // that descriptor is user-mode only
 	int           async_error     = 0;       // errno of the failed step, if any

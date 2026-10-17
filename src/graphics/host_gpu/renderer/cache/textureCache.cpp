@@ -2,8 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
-#include "common/hangTrace.h"
 #include "common/emulatorConfig.h"
+#include "common/hangTrace.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/asyncWriteEstimate.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -19,6 +20,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/imageClearRange.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -26,18 +28,16 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "kernel/memory.h"
-#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
-#include <optional>
 #include <atomic>
 #include <bit>
-#include <cinttypes>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +45,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
@@ -4008,6 +4009,10 @@ void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	     m_slot_images[image.depth_id].info.samples != 1)) {
 		return;
 	}
+	// KYTY_UFFD_WP_ASYNC_ESTIMATE: what asynchronous tracking would collect for this image, ahead
+	// of the CPU-dirty tests below.
+	AsyncWriteEstimate::NoteConsume(AsyncWriteEstimate::Site::Image, image.info.data.address,
+	                                image.info.data.size);
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();

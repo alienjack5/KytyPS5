@@ -700,6 +700,22 @@ if(LINUX)
 	target_link_libraries(hang_watchdog_tests Threads::Threads)
 endif()
 
+# The collection gate of asynchronous write tracking (graphics/host_gpu/writeCollectGate.h): one
+# collection per chunk and synchronization epoch.
+add_executable(write_collect_gate_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/WriteCollectGateTests.cpp")
+target_link_libraries(write_collect_gate_tests common)
+target_include_directories(write_collect_gate_tests PRIVATE ${inc_headers})
+
+# The estimator of asynchronous write tracking (graphics/host_gpu/asyncWriteEstimate.h,
+# KYTY_UFFD_WP_ASYNC_ESTIMATE): chunks to collect by consumer and the period line.
+add_executable(async_write_estimate_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AsyncWriteEstimateTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/asyncWriteEstimate.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/faultCost.cpp"
+)
+target_link_libraries(async_write_estimate_tests common)
+target_include_directories(async_write_estimate_tests PRIVATE ${inc_headers})
+
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
@@ -1229,6 +1245,8 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
 	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
+	add_test(NAME write_collect_gate COMMAND $<TARGET_FILE:write_collect_gate_tests>)
+	add_test(NAME async_write_estimate COMMAND $<TARGET_FILE:async_write_estimate_tests>)
 	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
 	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
@@ -2432,6 +2450,8 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		hang_watchdog_tests
+		write_collect_gate_tests
+		async_write_estimate_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

@@ -69,6 +69,69 @@ frame. The log shows the measured costs in a `Kyty platform:` line and
    tracking with userfaultfd write-protection (KYTY_UFFD_WP=1): on`. If it says
    `unavailable`, the kernel is too old or userfaultfd is blocked, and
    everything runs as without the flag.
+4. Optional, measurement only: `"KYTY_UFFD_WP_ASYNC_ESTIMATE": "1"` in
+   `u59-preset.json` (or `KYTY_UFFD_WP_ASYNC_ESTIMATE=1` in the environment of a
+   direct `kyty_emulator` run) estimates what asynchronous write tracking would
+   cost in the game, while the game keeps running with the current tracking.
+   See the next section.
+
+### Measuring what asynchronous tracking would cost
+
+Linux 6.7 and newer can resolve a write to a write-protected page in the kernel
+(`UFFD_FEATURE_WP_ASYNC`), without a signal, and report and protect again
+exactly the written pages in one call (`PAGEMAP_SCAN`). The planned
+asynchronous tracking mode (`KYTY_UFFD_WP_ASYNC`) would collect the written
+pages that way before GPU work uses a range, instead of taking a fault per
+write and marking a whole 1 MiB window dirty. `tools/fault-bench` measures the
+modes without the emulator (`cmake --build _Build/linux --target fault_bench`,
+then see `tools/fault-bench/README.md`); on an i7-11800H the asynchronous mode
+cost 1.1-1.3 ms per frame instead of 2.2-3.7 ms with 4-15 writing threads.
+Whether a game gains depends on how much memory its draws touch between
+synchronization points, so the estimator counts that in the game:
+
+```sh
+KYTY_UFFD_WP_ASYNC_ESTIMATE=1 KYTY_FAULT_COST_LOG=10 \
+  ./_Build/linux/install/kyty_emulator --game <game folder>
+```
+
+With the launcher, put `"KYTY_UFFD_WP_ASYNC_ESTIMATE": "1"` and
+`"KYTY_FAULT_COST_LOG": "10"` in `u59-preset.json` (the log line comes every
+60 s otherwise). At startup the log shows what the kernel offers, the self-test
+of the asynchronous mode with the measured cost of one scan, and the tracking
+mode, which stays as it was:
+
+```
+Kyty platform: asynchronous userfaultfd write-protection (KYTY_UFFD_WP_ASYNC_ESTIMATE=1): available (kernel features 0x1ffff, user-mode-only descriptor, PAGEMAP_SCAN on /proc/self/pagemap)
+Kyty platform: asynchronous write-protection self-test: ok (... one scan of 2 MiB with 64 written pages 8.4 us)
+Kyty platform: guest write tracking: mprotect
+```
+
+On a kernel without the asynchronous mode the first line says `unavailable`
+and why, and the estimate uses an assumed scan cost of 10 us. Then, every
+`KYTY_FAULT_COST_LOG` seconds, next to the `Kyty fault cost:` line:
+
+```
+Kyty async estimate: last 10 s, per frame: 42.0 chunks of 2 MiB to collect in 310.5 consumer calls (buffer 20.1, written 12.3, image 8.9, bda 0.5, gpu-dirty 0.0, download 0.2), ~0.37 ms at 8.9 us per chunk (measured by the startup self-test); measured now 2.41 ms (faults 1.20, protect 0.91, unprotect 0.30)
+```
+
+- `chunks of 2 MiB to collect`: the chunks of guest memory the asynchronous
+  mode would scan per frame, once per chunk and synchronization point, counted
+  for the consumer that first asked for it: a buffer synchronized for reading
+  (`buffer`) or for writing (`written`), an image refreshed (`image`), the BDA
+  pass (`bda`), a range marked GPU-written (`gpu-dirty`), a readback
+  (`download`). `consumer calls` are the synchronizations that asked.
+- `~N ms at M us per chunk`: the estimated scan time per frame; `M` from the
+  startup self-test, or 10 us assumed. It is an upper bound: every chunk any
+  consumer touches in a synchronization interval counts.
+- `measured now`: what the current mode spends per frame in write faults and
+  protection calls, the time the asynchronous mode would replace. The
+  comparison leaves out one more saving: with 1 MiB windows a fault marks 256
+  pages dirty and all of them are uploaded, while the asynchronous mode marks
+  only the written pages (5-6 times fewer in the benchmark).
+
+A `Kyty async estimate: whole run:` summary comes at exit. The asynchronous
+mode is worth finishing for a game where the estimate stays clearly below the
+measured time in the places that matter.
 
 ## Portability changes
 

@@ -11,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/asyncWriteEstimate.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
@@ -44,14 +45,14 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2132,6 +2133,7 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
                                   ReadMemoryTrace& trace) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
+	AsyncWriteEstimate::NoteConsume(AsyncWriteEstimate::Site::Download, vaddr, size);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
@@ -3019,6 +3021,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
+	// KYTY_UFFD_WP_ASYNC_ESTIMATE: what asynchronous tracking would collect here, ahead of the
+	// relaxed and memo checks below, which read CPU-dirty state.
+	AsyncWriteEstimate::NoteConsume(is_written ? AsyncWriteEstimate::Site::WrittenBuffer
+	                                           : AsyncWriteEstimate::Site::Buffer,
+	                                vaddr, size);
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
 	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
 	// GPU-written images; the BDA hot-pass verification scans in full.
@@ -5172,6 +5179,11 @@ void BufferCache::VerifyBdaEpochSkip(const RangeSet& mapped_ranges) {
 
 void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	const bool collect = Profiler::AggregateEnabled();
+	if (AsyncWriteEstimate::Enabled()) {
+		mapped_ranges.ForEach([](uint64_t begin, uint64_t end) {
+			AsyncWriteEstimate::NoteConsume(AsyncWriteEstimate::Site::Bda, begin, end - begin);
+		});
+	}
 	// Read these before scanning: a fault to an already scanned page must force the NEXT
 	// pass, even if its dirty transition completed before this pass finished uploading.
 	// CpuMutationEpoch() is saturated while any hot page exists (hot pages are written without

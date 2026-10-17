@@ -1,0 +1,145 @@
+name: Linux CI (fork)
+
+# Builds the launcher and every test executable with the toolchain of the local Fedora 44
+# distrobox (clang 22, Qt 6.11), then runs on Mesa's lavapipe (a CPU Vulkan driver) every test
+# that does not need a hardware GPU. The shader recompiler compute suite (shader_recompiler_compute_tests)
+# and kernel_file_system need fragment barycentrics and 64-bit LDS/image atomics, which lavapipe
+# lacks: run those locally on a GPU, one at a time on an 8 GB GPU (one instance peaks at ~3.7 GiB).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux:
+    name: Build and test (Fedora 44, lavapipe)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git-core tar zstd gzip findutils which diffutils python3 ccache \
+            clang lld ninja-build cmake glslang pkgconf-pkg-config \
+            mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
+            libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
+            alsa-lib-devel pulseaudio-libs-devel pipewire-devel systemd-devel dbus-devel libusb1-devel \
+            wayland-devel wayland-protocols-devel libdecor-devel qt6-qtbase-devel \
+            mesa-vulkan-drivers vulkan-loader vulkan-tools
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up compiler cache
+        run: |
+          # Paths inside the container ($GITHUB_WORKSPACE), not the runner's.
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_MAXSIZE=5G"
+            echo "CCACHE_COMPILERCHECK=content"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-fedora44-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-fedora44-${{ github.ref_name }}-
+            ccache-fedora44-
+
+      - name: Configure
+        run: |
+          cmake -S . -B _Build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY="$GITHUB_REPOSITORY"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          ccache --zero-stats
+          cmake --build _Build/ci --target launcher kyty_tests --parallel "$(nproc)" -- -k 0 2>&1 | tee build.log
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-fedora44-${{ github.ref_name }}-${{ github.sha }}
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first errors as annotations.
+          if [ -f build.log ]; then
+            grep -E 'error:|FAILED:|undefined reference|fatal' build.log | sort -u | head -n 40 |
+              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+          fi
+
+      - name: Test
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          set -o pipefail
+          vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|apiVersion' || true
+          ctest --test-dir _Build/ci --show-only=json-v1 > ctest.json
+          python3 -I - ctest.json ci-tests.txt <<'EOF'
+          import json, os, sys
+          # Tests that need a hardware GPU (see the comment at the top of this file).
+          gpu_executables = {"shader_recompiler_compute_tests"}
+          gpu_tests = {"kernel_file_system"}
+          tests = json.load(open(sys.argv[1]))["tests"]
+          run, skipped = [], []
+          for test in tests:
+              executable = os.path.basename(test.get("command", ["?"])[0])
+              (skipped if executable in gpu_executables or test["name"] in gpu_tests else run).append(test["name"])
+          open(sys.argv[2], "w").write("\n".join(run) + "\n")
+          summary = f"{len(run)} of {len(tests)} tests run on lavapipe; {len(skipped)} need a hardware GPU and run locally."
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write(summary + "\n")
+          EOF
+          ctest --test-dir _Build/ci --tests-from-file ci-tests.txt -j "$(nproc)" --timeout 600 \
+            --output-on-failure 2>&1 | tee test.log
+
+      - name: Show test failures
+        if: failure()
+        run: |
+          # The failing tests' output as annotations, so a failure can be read from the run summary.
+          if [ -f test.log ]; then
+            sed -n '/The following tests FAILED/,$p' test.log | grep -E '^\s+[0-9]+ - ' |
+              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+          fi
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-ci-logs
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore

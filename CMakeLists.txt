@@ -2475,6 +2475,25 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		ampr_counter_bank_tests
+		cp_sequencer_tests
+		cpu_placement_tests
+		draw_prep_tests
+		eop_timestamp_tests
+		event_queue_semantics_tests
+		host_input_pulse_tests
+		image_cache_gc_policy_tests
+		live_switch_tests
+		null_texture_desc_tests
+		occlusion_reset_tests
+		pipeline_compile_queue_tests
+		profiler_counter_tests
+		repeat_trace_tests
+		shader_code_snapshot_tests
+		spirv_cache_salt_tests
+		texel_image_lookup_tests
+		texture_set_cache_tests
+		thread_service_tests
 	)
 endif()
 

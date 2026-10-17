@@ -57745,6 +57745,14 @@ int main(int argc, char **argv) {
   if (std::getenv("KYTY_CB_SHADER_MASK_EXPORTS") == nullptr) {
     SetEnvironment("KYTY_CB_SHADER_MASK_EXPORTS", "1");
   }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // The fatal-contract cases (ExpectFatal, built outside Windows) check the exits that
+  // KYTY_SKIP_INVALID (default on) replaces with null bindings and skipped draws; =0 restores
+  // them. An explicit value wins.
+  if (std::getenv("KYTY_SKIP_INVALID") == nullptr) {
+    SetEnvironment("KYTY_SKIP_INVALID", "0");
+  }
+#endif
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--gi-decode-inventory") == 0) {
     EnsureConfigInitialized();
     return GiProbeTests::GiDecodeInventory(argv[2], argc == 4 ? argv[3] : nullptr);

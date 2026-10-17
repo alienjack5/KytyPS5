@@ -8339,12 +8339,11 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
       EncodeSmem0(0x08, 8, 4),
-      0u,                          // loop: s_buffer_load_dword s8, s[4:7]
+      0u,                          // loop: s_buffer_load_dword s8, s[8:11], s0
       EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
       EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
       EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
@@ -8354,14 +8353,25 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
       0xbf810000u,
   };
 
+  std::array<uint32_t, 64> user_data{};
+  for (const uint32_t base : {8u, 48u}) {
+    user_data[base] = base == 8u ? 0x1000u : 0x2000u;
+    user_data[base + 2] = 64u;
+    user_data[base + 3] = 0x30005204u;
+  }
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying scalar-buffer descriptor did not terminate "
-              "compilation");
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "self-modifying scalar descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty(),
+        "self-modifying scalar descriptor was flattened or bound on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
+void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
       EncodeMubuf0(0x0c),
@@ -8374,13 +8384,15 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
       0xbf810000u,
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying vector-buffer descriptor did not terminate "
-              "compilation");
+  const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "loop-carried vector descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty(),
+        "loop-carried vector descriptor was evaluated on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
-#endif
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
@@ -16007,10 +16019,8 @@ int main(int argc, char **argv) {
   // Upstream b4d32394b/ec3e48cdd made these two loop-carried descriptor cases structured GPU loops
   // (TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured); our resource tracker still rejects
   // them, as before this merge.
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
-#endif
+  TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();

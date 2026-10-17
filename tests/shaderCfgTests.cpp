@@ -1481,12 +1481,14 @@ void TestSpirvRequirementsAnalysis() {
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
       },
       "invalid buffer requirement metadata did not terminate analysis");
+  // Vertex and pixel shaders take ADD_TID from the host subgroup lane (graphics_buffer_add_tid);
+  // a hull shader's lane is its control-point id, so it still fails.
   ExpectFatal(
       [&] {
-        add_tid.stage = ShaderType::Vertex;
+        add_tid.stage = ShaderType::TessellationControl;
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
       },
-      "graphics buffer ADD_TID did not terminate requirements analysis");
+      "hull shader buffer ADD_TID did not terminate requirements analysis");
 #endif
 
   Program empty;

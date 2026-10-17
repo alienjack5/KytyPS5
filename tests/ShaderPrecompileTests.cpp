@@ -340,7 +340,12 @@ void TestReplayDriver() {
 		settings.max_entries = 10;
 		ShaderPrecompiler precompiler(journal, settings, [&](const auto&, const auto&) -> ShaderPrecompiler::Outcome {
 			calls++;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 			throw std::runtime_error("compile failed");
+#else
+			// Builds without exceptions (the Linux build): a failing compile reports Failed itself.
+			return ShaderPrecompiler::Outcome::Failed;
+#endif
 		});
 		precompiler.Wait();
 		Expect(calls == 10 && precompiler.GetProgress().failed == 10 && precompiler.GetProgress().total == 10,

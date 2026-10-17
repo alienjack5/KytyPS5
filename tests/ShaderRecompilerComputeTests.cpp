@@ -58491,15 +58491,15 @@ int main(int argc, char **argv) {
     vulkan.CheckTilerScratchHold();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUploadDma();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-keep-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDepthFeedbackKeep();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckUploadDma();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-layout-stable-only") == 0) {

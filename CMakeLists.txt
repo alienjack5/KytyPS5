@@ -2490,6 +2490,7 @@ if(BUILD_TESTING)
 		profiler_counter_tests
 		repeat_trace_tests
 		shader_code_snapshot_tests
+		sparse_residency_stress_tests
 		spirv_cache_salt_tests
 		texel_image_lookup_tests
 		texture_set_cache_tests

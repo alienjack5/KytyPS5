@@ -307,6 +307,7 @@ void GraphicContext::DestroyAllocator() {
 	}
 	if (m_sparse_timeline != nullptr) {
 		WaitSparseBinds();
+		DestroyCompletedSparseImages(true);
 		device.destroySemaphore(m_sparse_timeline, nullptr);
 		m_sparse_timeline = nullptr;
 	}
@@ -452,6 +453,52 @@ void GraphicContext::WaitSparseBinds() {
 	RequireVulkanSuccess(device.waitSemaphores(&wait, UINT64_MAX), "wait for sparse image binds");
 }
 
+uint64_t GraphicContext::SparseBindsCompleted() {
+	uint64_t known   = m_sparse_completed.load(std::memory_order_relaxed);
+	uint64_t reached = 0;
+	if (m_sparse_timeline != nullptr &&
+	    known < m_sparse_signalled.load(std::memory_order_acquire) &&
+	    device.getSemaphoreCounterValue(m_sparse_timeline, &reached) == vk::Result::eSuccess) {
+		while (reached > known && !m_sparse_completed.compare_exchange_weak(
+		                              known, reached, std::memory_order_relaxed)) {
+		}
+	}
+	return m_sparse_completed.load(std::memory_order_relaxed);
+}
+
+void GraphicContext::DestroyCompletedSparseImages(bool all) {
+	std::vector<DeferredSparseImage> done;
+	{
+		std::scoped_lock lock(m_sparse_mutex);
+		if (m_sparse_deferred.empty()) {
+			return;
+		}
+		const auto completed = all ? UINT64_MAX : SparseBindsCompleted();
+		size_t     kept      = 0;
+		for (size_t index = 0; index < m_sparse_deferred.size(); index++) {
+			if (m_sparse_deferred[index].bind_value <= completed) {
+				done.push_back(std::move(m_sparse_deferred[index]));
+			} else {
+				if (kept != index) {
+					m_sparse_deferred[kept] = std::move(m_sparse_deferred[index]);
+				}
+				kept++;
+			}
+		}
+		m_sparse_deferred.resize(kept);
+	}
+	if (done.empty()) {
+		return;
+	}
+	Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageDestroy);
+	for (const auto& deferred: done) {
+		device.destroyImage(deferred.image, nullptr);
+		for (const auto allocation: deferred.allocations) {
+			vmaFreeMemory(allocator, allocation);
+		}
+	}
+}
+
 void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_level,
                                            vk::Semaphore wait_semaphore, uint64_t wait_value) {
 	EXIT_IF(!image.sparse || image.image == nullptr);
@@ -485,6 +532,7 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
 		state.first_bound = first;
 		return;
 	}
+	DestroyCompletedSparseImages(); // their memory first
 	VkMemoryRequirements requirements {};
 	requirements.size           = bytes;
 	requirements.alignment      = state.block_size;
@@ -558,6 +606,7 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
 		}
 		RequireVulkanSuccess(result, "bind sparse image memory");
 		m_sparse_signalled.store(signal, std::memory_order_release);
+		state.bind_value = signal;
 	}
 	state.allocations.push_back(allocation);
 	state.bytes += bytes;
@@ -871,7 +920,18 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 			                             static_cast<uint32_t>(image.usage), image.sparse->bytes);
 		}
 		VramStats::Note(VramStats::Kind::Image, true, -static_cast<int64_t>(image.sparse->bytes));
-		{
+		// The binds that name the image and its memory must have completed first (vkDestroyImage,
+		// vkFreeMemory). The caller waited for its own submissions of the image: TextureCache
+		// defers a deletion to its current tick, whose batch waits for every bind before it
+		// (CommandScheduler::Submit), but an image deleted right after it grew can keep that bind
+		// queued, and the NVIDIA Linux driver then loses the device (memmapperExecuteUnmap:
+		// NV_ERR_OBJECT_NOT_FOUND). Such an image waits in m_sparse_deferred instead.
+		DestroyCompletedSparseImages();
+		if (image.sparse->bind_value > SparseBindsCompleted()) {
+			std::scoped_lock lock(m_sparse_mutex);
+			m_sparse_deferred.push_back(
+			    {image.image, std::move(image.sparse->allocations), image.sparse->bind_value});
+		} else {
 			Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageDestroy);
 			device.destroyImage(image.image, nullptr);
 			for (const auto allocation: image.sparse->allocations) {

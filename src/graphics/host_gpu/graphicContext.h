@@ -237,6 +237,8 @@ struct GraphicContext {
 	// nothing created otherwise). BindSparseImageLevels binds memory behind levels >= first_level
 	// that have none yet: unbound levels read as zero (residencyNonResidentStrict) and writes to them
 	// are discarded, so only levels a view can sample need memory. DeleteImage frees the memory.
+	// The caller waits for its own submissions that use the image; an image whose last bind may
+	// still be queued is destroyed once that bind completed (Vulkan requires it), not waited for.
 	//
 	// Ordering (Bug A): the binds run on the side queue and are ordered on the GPU, never waited for
 	// on the host. A bind waits for `wait_semaphore` >= `wait_value` (the master timeline at the last
@@ -271,6 +273,18 @@ private:
 	std::atomic<uint64_t>                      m_sparse_completed {0}; // known reached on the GPU
 	std::map<std::tuple<vk::Format, vk::ImageUsageFlags, vk::ImageCreateFlags>, bool>
 	                                           m_sparse_support;
+	// Sparse images DeleteImage could not destroy yet because a bind of theirs may still be queued
+	// (guarded by m_sparse_mutex): destroyed once SparseBindSemaphore() reaches bind_value.
+	struct DeferredSparseImage {
+		vk::Image                  image = nullptr;
+		std::vector<VmaAllocation> allocations;
+		uint64_t                   bind_value = 0;
+	};
+	std::vector<DeferredSparseImage> m_sparse_deferred;
+	// The value SparseBindSemaphore() reached (asks the device only while binds are pending).
+	[[nodiscard]] uint64_t SparseBindsCompleted();
+	// Destroys the deferred images whose binds completed (all of them: after WaitSparseBinds).
+	void DestroyCompletedSparseImages(bool all = false);
 	struct RetiredNativeImage {
 		vk::ImageCreateInfo create;
 		vk::Image image;
@@ -331,6 +345,7 @@ struct VulkanImage {
 		uint64_t                   block_size       = 0;
 		uint32_t                   memory_type_bits = 0;
 		uint64_t                   bytes            = 0;
+		uint64_t                   bind_value       = 0; // SparseBindSemaphore() at its last bind
 		std::vector<VmaAllocation> allocations;
 	};
 	std::unique_ptr<SparseState> sparse;

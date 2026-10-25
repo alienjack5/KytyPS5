@@ -34,6 +34,26 @@ struct TextureBinding {
 	uint32_t                   memo_slot = 0;
 };
 
+// A guest range's resolution in the buffer cache: the cache buffer (or the stream buffer for a
+// stream copy) and the offset of the range's first byte in it. `id` is the cache buffer's slot
+// (generation included; unset for a stream copy); RenderExecutor::RebindBuffers records one per V#
+// binding, AcquireVertexBuffersInto per merged vertex range, PrepareIndexBuffer for the index buffer.
+struct BufferResolution {
+	Buffer*  buffer          = nullptr;
+	uint64_t offset          = 0;
+	BufferId id {};
+	uint64_t structure_epoch = 0; // BufferCache::BufferStructureEpoch when resolved (cache buffer)
+	bool     stream          = false;
+};
+
+// KYTY_DRAW_RUN_BINDINGS (drawRun.h): a resolution with the guest range it was made for, as the
+// draw-run record keeps it and a continuation reuses it.
+struct DrawRunBufferBinding {
+	uint64_t         vaddr = 0;
+	uint64_t         size  = 0;
+	BufferResolution resolved;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -47,6 +67,9 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// What RebindBuffers resolved each V# binding to (one per `buffers` entry; empty for a null
+	// binding), for the draw-run record (KYTY_DRAW_RUN_BINDINGS).
+	std::vector<BufferResolution>         buffer_resolutions;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};

@@ -102,6 +102,9 @@ enum class Item : uint8_t {
 	ReadMisses,     // and misses
 	LogEntries,     // KYTY_CP_COMMIT_STATS=steps: coherence log entries a certificate check read
 	CertRanges,     // and the certificate's ranges
+	// KYTY_DRAW_RUN_BINDINGS (drawRun.h): what a continuation reused from its run.
+	RunBindingsReused,    // V#, vertex-range and index bindings taken from the run's resolutions
+	RunBindingsFallback,  // reuse refused at commit (the buffer structure epoch moved since)
 	Count
 };
 

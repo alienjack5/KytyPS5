@@ -81,6 +81,7 @@ extern Live::Switch g_image_epoch; // KYTY_DRAW_RUN_IMAGE_EPOCH
 extern Live::Switch g_cont_eligible; // KYTY_DRAW_RUN_CONT_ELIGIBLE
 extern Live::Switch g_targets;       // KYTY_DRAW_RUN_TARGETS
 extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
+extern Live::Switch g_bindings;      // KYTY_DRAW_RUN_BINDINGS
 } // namespace Detail
 
 [[nodiscard]] inline Mode GetMode() {
@@ -234,6 +235,30 @@ extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
 	return Detail::g_pipeswap.On();
 }
 
+// KYTY_DRAW_RUN_BINDINGS (live, default 0; 1 on, verify, exit; with KYTY_DRAW_RUN=1): a
+// continuation reuses the run's buffer resolutions. The record keeps, per V# slot of each stage,
+// per merged vertex range and for the index buffer, the guest range the recorded draw resolved and
+// the cache buffer (id, pointer, buffer structure epoch; or the stream buffer) and offset it got,
+// refreshed by every recorded draw. A continuation of the same run (activity epoch, command buffer,
+// tick and rendering instance of the record) whose range for a slot is exactly the recorded one, with
+// the buffer structure epoch unchanged (a stream copy: within the record's tick), binds {buffer,
+// offset} without the binding memo, the memory-tracker signature or synchronization
+// (RenderExecutor::DrawRunReusableBinding); FindBuffers still runs for the slot (FindBuffer is not
+// deterministic between overlapping cache buffers covering a range, so its id is neither reused nor
+// compared). Any other range, and every written or formatted binding, takes the normal path and
+// refreshes the entry; a moved structure epoch counts a fallback. Reuse for a *different* range
+// inside the recorded cache buffer was tried and dropped: the lookup may pick another buffer covering
+// it (ASTRO's PLAYROOM, 3 of ~5 M verify checks). verify: the normal lookup runs as well and a
+// different buffer or offset (a stream copy: buffer only) is a mismatch (DrawRunVerify line, part
+// "buffers"); "exit" stops at the first, whatever KYTY_DRAW_RUN's mode. A change of the value ends
+// every run (NoteForeignActivity). Measured on ASTRO's PLAYROOM (2026-10-18, intervals with
+// >= 5,000 draws per frame): a continuation's commit 5.30 -> 4.65 us, its gap 0.71 -> 0.52 us, 2.9
+// bindings reused per continued draw.
+[[nodiscard]] inline int64_t BindingsMode() {
+	return Detail::g_bindings.Get();
+}
+
+
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the
 // GPU thread; other threads only bump it.
 // KYTY_DRAW_RUN_QUIET_OPS (default on): two kinds of command-processor work between draws do not
@@ -310,6 +335,12 @@ struct Totals {
 	std::atomic<uint64_t> swap_matches {0};        // KYTY_DRAW_RUN_PIPESWAP: the swap key matched
 	std::atomic<uint64_t> swapped {0};             // continued with a pipeline swap (verify: would have)
 	std::atomic<uint64_t> swap_incompatible {0};   // vertex programs' bindings or outputs differ
+	// KYTY_DRAW_RUN_BINDINGS: bindings taken from the run's resolutions, reuse refused at commit
+	// (structure epoch moved); verify checks and mismatches.
+	std::atomic<uint64_t> bindings_reused {0};
+	std::atomic<uint64_t> bindings_fallback {0};
+	std::atomic<uint64_t> bindings_verify_checks {0};
+	std::atomic<uint64_t> bindings_verify_mismatches {0};
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 	std::atomic<uint64_t> misses[static_cast<uint32_t>(Miss::Count)] {};

@@ -1573,10 +1573,14 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                
 // draw has no binding plan (or verifies it), the acquired ranges are not value-initialised (only
 // the merged ones are written and read), and no second PreparedVertexBuffers is built and copied.
 // Every value it computes and every call it makes, in order, are AcquireVertexBuffers'.
+// run (optional): the executor whose draw-run record may supply a merged range's resolution
+// (KYTY_DRAW_RUN_BINDINGS, RenderExecutor::DrawRunReusableBinding) and that records every merged
+// range's resolution for the next record (m_run_vertex_ranges).
 static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
                                      const ShaderVertexInputInfo&     vs_input_info,
                                      const DrawPrep::VertexRangePlan* planned,
-                                     PreparedVertexBuffers&           prepared) {
+                                     PreparedVertexBuffers&           prepared,
+                                     RenderExecutor*                  run = nullptr) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
@@ -1622,7 +1626,9 @@ static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range           = ranges->merged[i];
 		const auto  size            = range.acquired_end - range.base_address;
-		const auto [handle, offset] = cache.ObtainBuffer(range.base_address, size, false);
+		const auto [handle, offset] = run != nullptr
+		                                  ? run->ObtainVertexRangeForRun(buffer, i, range.base_address, size)
+		                                  : cache.ObtainBuffer(range.base_address, size, false);
 		acquired[i]                 = {handle, offset};
 		SetVulkanObjectNameF(
 		    buffer.GetContext().GetGraphics().device, handle->Handle(),
@@ -2301,6 +2307,9 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_targets_kept   = false;
 	m_run_pipeswap       = false;
 	m_prepared_validated = false;
+	// KYTY_DRAW_RUN_BINDINGS: this draw's vertex-range and index resolutions, filled as it acquires them.
+	m_run_vertex_range_count = 0;
+	m_run_index              = {};
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
 		DrawRun::NoteForeignActivity("draw outside an engine commit");
 	}
@@ -2317,6 +2326,105 @@ bool RenderExecutor::DrawRunCommandUnchanged(const CommandBuffer& buffer) const 
 	       m_context.GetCommandScheduler().CurrentTick() == m_run.tick &&
 	       buffer.ActiveRenderingSerial() != 0 &&
 	       buffer.ActiveRenderingSerial() == m_run.rendering_serial;
+}
+
+// KYTY_DRAW_RUN_BINDINGS (drawRun.h). A continuation passed DrawRunCandidate for this draw: the
+// record's activity epoch, command buffer, tick and rendering instance are the current ones, and
+// nothing but this draw's own buffer work runs between that check and the reuse.
+bool RenderExecutor::DrawRunBindingsReusable() const {
+	return m_run_active && m_run.bindings_valid && DrawRun::BindingsMode() != 0;
+}
+
+const DrawRunBufferBinding* RenderExecutor::DrawRunReusableBinding(
+    std::span<const DrawRunBufferBinding> bindings, uint32_t slot, uint64_t vaddr,
+    uint64_t size) const {
+	if (slot >= bindings.size()) {
+		return nullptr;
+	}
+	const auto& entry = bindings[slot];
+	if (entry.vaddr != vaddr || entry.size != size || entry.resolved.buffer == nullptr) {
+		return nullptr;
+	}
+	// A stream copy stays where the ring put it for this command buffer (the record's tick); a
+	// cache buffer holds the range at the same offset while the structure epoch is unchanged.
+	if (!entry.resolved.stream &&
+	    entry.resolved.structure_epoch != m_context.GetBufferCache().BufferStructureEpoch()) {
+		DrawRun::GetTotals().bindings_fallback.fetch_add(1, std::memory_order_relaxed);
+		CommitStats::AddItems(CommitStats::Item::RunBindingsFallback, 1);
+		return nullptr;
+	}
+	return &entry;
+}
+
+void RenderExecutor::DrawRunVerifyBinding(const DrawRunBufferBinding& reused, const Buffer* buffer,
+                                          uint64_t offset, const char* what) {
+	auto& totals = DrawRun::GetTotals();
+	totals.bindings_verify_checks.fetch_add(1, std::memory_order_relaxed);
+	const bool same = buffer == reused.resolved.buffer &&
+	                  (reused.resolved.stream || offset == reused.resolved.offset);
+	if (!same) {
+		totals.bindings_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+		DrawRun::ReportMismatch(what, offset);
+		// ReportMismatch stops only for KYTY_DRAW_RUN=exit; this switch's own "exit" stops too.
+		if (DrawRun::BindingsMode() == 3) {
+			EXIT("DrawRunVerify: a continuation would have bound a different %s\n", what);
+		}
+	}
+}
+
+std::pair<Buffer*, uint64_t> RenderExecutor::ObtainVertexRangeForRun(CommandBuffer& buffer,
+                                                                    uint32_t index, uint64_t base,
+                                                                    uint64_t size) {
+	auto&      cache = buffer.GetContext().GetBufferCache();
+	const auto mode  = DrawRunBindingsReusable() ? DrawRun::BindingsMode() : 0;
+	const DrawRunBufferBinding* reuse =
+	    mode != 0 ? DrawRunReusableBinding(
+	                    std::span {m_run.vertex_ranges.data(), m_run.vertex_range_count}, index,
+	                    base, size)
+	              : nullptr;
+	std::pair<Buffer*, uint64_t> result;
+	if (reuse != nullptr && mode == 1) {
+		result = {reuse->resolved.buffer, reuse->resolved.offset};
+		DrawRun::GetTotals().bindings_reused.fetch_add(1, std::memory_order_relaxed);
+		CommitStats::AddItems(CommitStats::Item::RunBindingsReused, 1);
+	} else {
+		result = cache.ObtainBuffer(base, size, false);
+		if (reuse != nullptr) {
+			DrawRunVerifyBinding(*reuse, result.first, result.second, "vertex range");
+		}
+	}
+	if (index < m_run_vertex_ranges.size()) {
+		m_run_vertex_ranges[index] = {
+		    base, size,
+		    {result.first, result.second, {}, cache.BufferStructureEpoch(),
+		     result.first == &cache.GetUtilityBuffer(MemoryUsage::Stream)}};
+		m_run_vertex_range_count = std::max(m_run_vertex_range_count, index + 1u);
+	}
+	return result;
+}
+
+std::pair<Buffer*, uint64_t> RenderExecutor::ObtainIndexBufferForRun(CommandBuffer& buffer,
+                                                                    uint64_t       address,
+                                                                    uint64_t       size) {
+	auto&      cache = buffer.GetContext().GetBufferCache();
+	const auto mode  = DrawRunBindingsReusable() ? DrawRun::BindingsMode() : 0;
+	const DrawRunBufferBinding* reuse =
+	    mode != 0 ? DrawRunReusableBinding(std::span {&m_run.index, 1}, 0, address, size) : nullptr;
+	std::pair<Buffer*, uint64_t> result;
+	if (reuse != nullptr && mode == 1) {
+		result = {reuse->resolved.buffer, reuse->resolved.offset};
+		DrawRun::GetTotals().bindings_reused.fetch_add(1, std::memory_order_relaxed);
+		CommitStats::AddItems(CommitStats::Item::RunBindingsReused, 1);
+	} else {
+		result = cache.ObtainBuffer(address, size, false);
+		if (reuse != nullptr) {
+			DrawRunVerifyBinding(*reuse, result.first, result.second, "index buffer");
+		}
+	}
+	m_run_index = {address, size,
+	               {result.first, result.second, {}, cache.BufferStructureEpoch(),
+	                result.first == &cache.GetUtilityBuffer(MemoryUsage::Stream)}};
+	return result;
 }
 
 RenderExecutor::DrawRunImage RenderExecutor::MakeDrawRunImage(ImageId id, bool texture) const {
@@ -3029,6 +3137,33 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.rendering_serial = buffer.ActiveRenderingSerial();
 	// The draw's push (whole or partial) is the last descriptor command at the bind point.
 	run.push_epoch = buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics);
+	// KYTY_DRAW_RUN_BINDINGS: the draw's buffer resolutions (every stage's V#s, its merged vertex
+	// ranges and index buffer), refreshed by every recorded draw, continuations included: the next
+	// draw continues this one, not the run's first.
+	run.bindings_valid = DrawRun::BindingsMode() != 0;
+	if (run.bindings_valid) {
+		// In place: the vectors keep their capacity from draw to draw (no churn per draw).
+		run.vertex_buffers.resize(0);
+		run.pixel_buffers.resize(0);
+		for (const auto* stage: stages) {
+			const auto type = stage->runtime->program->stage;
+			auto* const out = type == ShaderType::Vertex  ? &run.vertex_buffers
+			                  : type == ShaderType::Pixel ? &run.pixel_buffers
+			                                              : nullptr;
+			const auto  count = stage->buffer_sources.size();
+			if (out == nullptr || stage->buffer_resolutions.size() != count) {
+				continue;
+			}
+			out->resize(count);
+			for (size_t i = 0; i < count; i++) {
+				const auto& source = stage->buffer_sources[i];
+				(*out)[i]          = {source.address, source.size, stage->buffer_resolutions[i]};
+			}
+		}
+		run.vertex_ranges      = m_run_vertex_ranges;
+		run.vertex_range_count = m_run_vertex_range_count;
+		run.index              = m_run_index;
+	}
 	if (m_run_active) {
 		// A continuation changed none of the recorded images, targets or bindings; a pipeline swap
 		// changed the vertex program and the pipeline (layout) the next draw is compared with.
@@ -3201,8 +3336,11 @@ void RenderExecutor::DrawRunVerify(const DrawRenderState& state, const RenderSta
 	}
 }
 
+// run (optional): the executor whose draw-run record may supply the index buffer's resolution and
+// that records it (KYTY_DRAW_RUN_BINDINGS, RenderExecutor::ObtainIndexBufferForRun).
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
-                                              const DrawIndexBufferSource& source) {
+                                              const DrawIndexBufferSource& source,
+                                              RenderExecutor*              run = nullptr) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
@@ -3218,7 +3356,9 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		                     static_cast<uint32_t>(source.type));
 	} else {
 		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		    run != nullptr
+		        ? run->ObtainIndexBufferForRun(buffer, source.address, source.size)
+		        : buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
@@ -3873,12 +4013,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 		if (CpCommit::Enabled(CpCommit::Part::Draws)) {
-			AcquireVertexBuffersInto(buffer, state.vertex_info[0], vertex_ranges, vertex_bindings);
+			AcquireVertexBuffersInto(buffer, state.vertex_info[0], vertex_ranges, vertex_bindings,
+			                         this);
 		} else {
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_ranges);
 		}
 		CommitStats::StepMark(CommitStats::Step::VertexAcquire);
-		index_binding = PrepareIndexBuffer(buffer, index_source);
+		index_binding = PrepareIndexBuffer(buffer, index_source, this);
 	}
 	PreparedIndirectBuffers indirect_buffers;
 	MeshIndirect::Converter::Slot mesh_slot;
@@ -3939,11 +4080,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// buffers).
 		vertex_bindings = PreparedVertexBuffers {};
 		if (CpCommit::Enabled(CpCommit::Part::Draws)) {
-			AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+			AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings, this);
 		} else {
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
 		}
-		index_binding = PrepareIndexBuffer(buffer, index_source);
+		index_binding = PrepareIndexBuffer(buffer, index_source, this);
 		if (indirect != nullptr) {
 			indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 		}

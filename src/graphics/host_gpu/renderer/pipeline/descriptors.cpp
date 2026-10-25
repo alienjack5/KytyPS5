@@ -182,11 +182,35 @@ static bool WriteRangeImageStatsEnabled() {
 	return enabled;
 }
 
+// The storage descriptor of `size` bytes at `offset` in `buffer`: the offset aligned down to the
+// storage alignment, the adjustment packed for the shader (buffer_offset), whole dwords bound.
+static vk::DescriptorBufferInfo StorageDescriptor(const GraphicContext& graphics, const Buffer& buffer,
+                                                  uint64_t offset, uint64_t size,
+                                                  uint32_t& buffer_offset) {
+	const auto alignment      = graphics.StorageMinAlignment();
+	const auto aligned_offset = Common::AlignDown(offset, alignment);
+	const auto adjustment     = offset - aligned_offset;
+	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	if (adjustment >= 256 || size > max_range - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported\n");
+	}
+	buffer_offset = static_cast<uint32_t>(adjustment);
+	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
+	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
+	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
+	// no-op for every shader-side check, and it makes the device check match them.
+	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
+	                                           : size + adjustment;
+	return {buffer.Handle(), aligned_offset, range};
+}
+
+// resolved (optional): the cache buffer and offset the binding got (KYTY_DRAW_RUN_BINDINGS).
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset,
-                    const std::vector<GuestRange>* written_ranges) {
+                    const std::vector<GuestRange>* written_ranges,
+                    BufferResolution* resolved = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -195,8 +219,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		BufferLookupStats::AddBinding(LookupOutcome::Null, 0);
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
-	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
+	const auto& graphics = context.GetGraphics();
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
@@ -221,21 +244,14 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		                                                   : outcome,
 		                              BufferLookupStats::Now() - lookup_start);
 	}
-	BufferLookupStats::PartScope descriptor_scope(BufferLookupStats::Part::Descriptor);
-	const auto aligned_offset = Common::AlignDown(offset, alignment);
-	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if (resolved != nullptr) {
+		auto& cache = context.GetBufferCache();
+		*resolved   = {buffer, offset, id, cache.BufferStructureEpoch(),
+		               buffer == &cache.GetUtilityBuffer(MemoryUsage::Stream)};
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
-	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
-	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
-	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
-	                                           : size + adjustment;
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	BufferLookupStats::PartScope descriptor_scope(BufferLookupStats::Part::Descriptor);
+	const vk::DescriptorBufferInfo result =
+	    StorageDescriptor(graphics, *buffer, offset, size, buffer_offset);
 	descriptor_scope.Stop();
 	const auto invalidate_start = resource.written ? BufferLookupStats::Now() : 0;
 	if (narrowed) {
@@ -2056,18 +2072,48 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	prefetch_scope.Stop();
 	CommitStats::StepMark(CommitStats::Step::RbHead);
+	// KYTY_DRAW_RUN_BINDINGS (drawRun.h): a continuation takes the record's resolution for a read
+	// binding whose range is exactly the recorded one (DrawRunReusableBinding); verify runs the
+	// normal path as well and compares. Every binding's resolution is kept for the next record.
+	const auto reuse_mode = DrawRunBindingsReusable() ? DrawRun::BindingsMode() : 0;
+	const std::vector<DrawRunBufferBinding>* recorded =
+	    reuse_mode == 0                       ? nullptr
+	    : program.stage == ShaderType::Vertex ? &m_run.vertex_buffers
+	    : program.stage == ShaderType::Pixel  ? &m_run.pixel_buffers
+	                                          : nullptr;
+	prepared.buffer_resolutions.clear();
+	prepared.buffer_resolutions.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		uint32_t   buffer_offset = 0;
-		const auto ranges_start  = program.info.buffers[i].written ? BufferLookupStats::Now() : 0;
-		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
-		                                                write_ranges_evaluated, write_scratch);
+		uint32_t    buffer_offset = 0;
+		const auto& resource      = program.info.buffers[i];
+		const auto& source        = prepared.buffer_sources[i];
+		auto&       resolved      = prepared.buffer_resolutions[i];
+		const DrawRunBufferBinding* reuse = nullptr;
+		if (recorded != nullptr && !resource.written && !resource.formatted && source.address != 0 &&
+		    source.size != 0) {
+			reuse = DrawRunReusableBinding(*recorded, i, source.address, source.size);
+		}
+		if (reuse != nullptr && reuse_mode == 1) {
+			resolved = reuse->resolved;
+			prepared.buffers.push_back(StorageDescriptor(m_context.GetGraphics(), *resolved.buffer,
+			                                             resolved.offset, source.size, buffer_offset));
+			DrawRun::GetTotals().bindings_reused.fetch_add(1, std::memory_order_relaxed);
+			CommitStats::AddItems(CommitStats::Item::RunBindingsReused, 1);
+			pack_memory_offset(i, buffer_offset);
+			continue;
+		}
+		const auto ranges_start = resource.written ? BufferLookupStats::Now() : 0;
+		const auto* written     = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
+		                                               write_ranges_evaluated, write_scratch);
 		if (ranges_start != 0) {
 			BufferLookupStats::AddPart(BufferLookupStats::Part::WriteRanges,
 			                           BufferLookupStats::Now() - ranges_start);
 		}
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset, written));
+		prepared.buffers.push_back(NativeStorageBuffer(m_context, source, resource, program.stage, i,
+		                                               buffer_offset, written, &resolved));
+		if (reuse != nullptr) {
+			DrawRunVerifyBinding(*reuse, resolved.buffer, resolved.offset, "buffer binding");
+		}
 		pack_memory_offset(i, buffer_offset);
 	}
 	CommitStats::StepMark(CommitStats::Step::RbBindings);

@@ -148,6 +148,44 @@ content identity before reusing images/views; changed pages can be revalidated.
 and descriptor-offset audits measure opportunity, not gains. The later U60 dynamic
 descriptor and native-input-reuse candidates are not in U59.
 
+### Draw-run buffer reuse (KYTY_DRAW_RUN_BINDINGS, fork addition)
+
+With `KYTY_DRAW_RUN=1` a draw that continues a run still resolves every V#, vertex
+range and index buffer through the buffer cache (binding memo, memory-tracker
+signature, synchronization). `KYTY_DRAW_RUN_BINDINGS=1` (live; default off; `verify`
+and `exit` as for `KYTY_DRAW_RUN_IMAGE_EPOCH`) keeps each recorded draw's resolutions
+in the run record and lets a continuation whose range for a slot is *exactly* the
+recorded one bind the recorded buffer and offset without the binding memo, the
+tracker signature or synchronization, while the buffer structure epoch is unchanged
+(a stream copy: within the tick). Any other range, and every written or formatted
+binding, takes the normal path; a changed epoch counts a fallback. Three variants
+were tried and dropped after verify runs or measurement: reusing a recorded buffer
+for a *different* range inside it, and skipping `FindBuffer` for the exact range
+(both because `FindBuffer` is not deterministic between overlapping cache buffers
+covering a range: 3 of ~5 million and then 1 verify mismatch in ASTRO's PLAYROOM),
+a run-level certified set for the certificate (≤ 0.2 µs reachable) and leaving
+identical vertex/index binds in place (a net zero).
+
+**Measured** (ASTRO's PLAYROOM, i7-11800H + RTX 3070 Laptop, 2026-10-18,
+`KYTY_CP_COMMIT_STATS=steps`, intervals with ≥ 5,000 draws per frame, 90% of them
+continuations): a continuation's commit 5.30 → 4.65 µs and its gap 0.71 → 0.52 µs
+(−14% per draw), 2.9 bindings reused per continued draw (binding-memo hits 3.28 →
+0.50 per draw, misses unchanged at 0.65: the per-draw constants are new data), 0
+fallbacks, fps p50 16.4 → 17.0. A 5-minute `exit` run found no exact-range
+mismatch. What remains per continuation is data movement (stream copies of new
+constants, descriptor writes, push constants), the draw command and the late image
+check; a larger step needs a run-level commit with per-draw data addressed through
+buffer device addresses, which this fork has not built.
+
+Regression check (God of War Sons of Sparta, 2026-10-25, `KYTY_DRAW_RUN=verify
+KYTY_DRAW_RUN_BINDINGS=verify`, 7.5 min): fps p50 60, CP busy 14–20% as before, 0 verify
+mismatches. A `KYTY_DRAW_RUN=exit` run of ASTRO's PLAYROOM with the final binary stops after
+about 25 s of heavy gameplay on the *acquisition* verify (`DrawRunVerifyImage ... field=CPU
+dirty`: a 256-byte texture becomes CPU-dirty between the two snapshots around the render-target
+acquisition). The same binary stops the same way with `KYTY_DRAW_RUN_BINDINGS=0`, so this is a
+race of the pre-existing `KYTY_DRAW_RUN` verify (the flag is set from the write-tracking path,
+asynchronously), not of the buffer reuse; it is listed as a follow-up.
+
 ## 3. Memory coherence, transfers and images
 
 ### Dirty tracking, epochs and buffer bindings
@@ -386,6 +424,7 @@ in the catalog; none should be represented as a direct runtime speedup.
 | U54 → U58 desert run | 65.51 → 61.11 FPS | Regression; reported p95 17.1 → 24.9 ms |
 | Broad preservation candidate → water-only | 23.91 → 27.08 FPS | Diagnostic 1080p/60 Hz comparison; extra transfers removed |
 | Clean U59 Sky Garden start | 27.53 FPS; p50 33.536, p95 49.720, p99 50.118 ms | A baseline, not a comparison against upstream |
+| Fork: `KYTY_DRAW_RUN_BINDINGS=1`, ASTRO's PLAYROOM gameplay (≥ 5,000 draws/frame) | continuation commit 5.30 → 4.65 µs, gap 0.71 → 0.52 µs; fps p50 16.4 → 17.0 | Same binary, same area, 3–5 min runs on an i7-11800H + RTX 3070 Laptop; the frame stays bound by the GPU thread's per-draw commit |
 
 The historical U54/U58 comparisons used 4K output and 120 Hz pacing with diagnostics.
 The clean U59 baseline used 1080p, 60 Hz, Mailbox and a 30-second PresentMon window

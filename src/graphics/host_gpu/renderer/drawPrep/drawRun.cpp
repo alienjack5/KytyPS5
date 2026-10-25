@@ -84,6 +84,20 @@ Live::Switch g_targets("KYTY_DRAW_RUN_TARGETS", [](const char* value) -> int64_t
 Live::Switch g_pipeswap("KYTY_DRAW_RUN_PIPESWAP", Live::ParseDefaultOff,
                         [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_PIPESWAP change"); });
 
+// KYTY_DRAW_RUN_BINDINGS: as KYTY_DRAW_RUN_IMAGE_EPOCH (0, 1, verify 2, exit 3). A record's
+// resolutions were made under one value: a change ends every run.
+static int64_t ParseReuseMode(const char* value) {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::strcmp(value, "exit") == 0 ? 3 : 1;
+}
+Live::Switch g_bindings("KYTY_DRAW_RUN_BINDINGS", ParseReuseMode,
+                        [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_BINDINGS change"); });
+
 } // namespace Detail
 
 namespace {
@@ -449,6 +463,9 @@ void ReportMismatch(const char* what, uint64_t detail) {
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < MismatchLogLimit()) {
 		const char* part = std::strstr(what, "acquisition") ? "acquisition" :
+		                   std::strstr(what, "buffer") ? "buffers" :
+		                   std::strstr(what, "vertex") ? "buffers" :
+		                   std::strstr(what, "index") ? "buffers" :
 		                   std::strstr(what, "transition") ? "transitions" :
 		                   std::strstr(what, "dynamic") ? "dynamic state" :
 		                   std::strstr(what, "view") ? "views" :
@@ -469,7 +486,7 @@ void PrintSummary() {
 		return;
 	}
 	static uint64_t                                          last_ns = 0;
-	static std::array<uint64_t, 27>                          last {};
+	static std::array<uint64_t, 31>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
 	// KYTY_CP_OWNED_COUNTERS (ownedCounters.h): the clock is read every 256th call (the line is
 	// due every 10 s; the commit path calls this once per draw).
@@ -485,7 +502,7 @@ void PrintSummary() {
 	if (now - last_ns < 10'000'000'000ull) {
 		return;
 	}
-	const std::array<uint64_t, 27> values {
+	const std::array<uint64_t, 31> values {
 	    g_totals.draws.load(std::memory_order_relaxed),
 	    g_totals.eligible.load(std::memory_order_relaxed),
 	    g_totals.key_matches.load(std::memory_order_relaxed),
@@ -512,8 +529,12 @@ void PrintSummary() {
 	    g_totals.targets_late.load(std::memory_order_relaxed),
 	    g_totals.swap_matches.load(std::memory_order_relaxed),
 	    g_totals.swapped.load(std::memory_order_relaxed),
-	    g_totals.swap_incompatible.load(std::memory_order_relaxed)};
-	std::array<uint64_t, 27> delta {};
+	    g_totals.swap_incompatible.load(std::memory_order_relaxed),
+	    g_totals.bindings_reused.load(std::memory_order_relaxed),
+	    g_totals.bindings_fallback.load(std::memory_order_relaxed),
+	    g_totals.bindings_verify_checks.load(std::memory_order_relaxed),
+	    g_totals.bindings_verify_mismatches.load(std::memory_order_relaxed)};
+	std::array<uint64_t, 31> delta {};
 	for (size_t i = 0; i < values.size(); i++) {
 		delta[i] = values[i] - last[i];
 	}
@@ -546,7 +567,8 @@ void PrintSummary() {
 	            " matches, %" PRIu64 " recalled, %" PRIu64 " sets missed; image epoch: %" PRIu64
 	            " skips, verify %" PRIu64 " checks, %" PRIu64 " mismatches; targets: %" PRIu64
 	            " kept, %" PRIu64 " late; pipeswap: %" PRIu64 " matches, %" PRIu64 " swapped, %" PRIu64
-	            " incompatible\n",
+	            " incompatible; run bindings: %" PRIu64 " reused, %" PRIu64
+	            " fallbacks, verify %" PRIu64 " checks, %" PRIu64 " mismatches\n",
 	            static_cast<double>(now - last_ns) * 1e-9,
 	            GetMode() == Mode::Verify ? "verify" : "on", delta[0], delta[1], delta[2], delta[3],
 	            delta[0] != 0 ? 100.0 * static_cast<double>(delta[3]) / static_cast<double>(delta[0])
@@ -554,7 +576,7 @@ void PrintSummary() {
 	            delta[4], misses.empty() ? " none" : misses.c_str(), delta[6], delta[7], delta[8],
 	            delta[9], delta[10], delta[11], delta[12], delta[13], delta[14], delta[15], delta[16],
 	            delta[17], delta[18], delta[19], delta[20], delta[21], delta[22], delta[23], delta[24],
-	            delta[25], delta[26]);
+	            delta[25], delta[26], delta[27], delta[28], delta[29], delta[30]);
 	std::fflush(stdout);
 	if (KeyDiagEnabled()) {
 		PrintKeyDiag(static_cast<double>(now - last_ns) * 1e-9);

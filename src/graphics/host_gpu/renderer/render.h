@@ -1022,6 +1022,16 @@ struct GraphicsDynamicStateShadow {
 
 class RenderExecutor {
 public:
+	// KYTY_DRAW_RUN_BINDINGS (drawRun.h): the committed draw's i-th merged vertex range / index
+	// buffer: the record's resolution when the draw continues the run and the entry is reusable
+	// (verify: the cache's as well, compared), else the buffer cache's; either way recorded for the
+	// next draw-run record. For AcquireVertexBuffersInto and PrepareIndexBuffer (renderDraw.cpp).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainVertexRangeForRun(CommandBuffer& buffer,
+	                                                                  uint32_t index, uint64_t base,
+	                                                                  uint64_t size);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainIndexBufferForRun(CommandBuffer& buffer,
+	                                                                  uint64_t address,
+	                                                                  uint64_t size);
 	explicit RenderExecutor(RenderContext& context);
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
@@ -1398,6 +1408,20 @@ private:
 		std::vector<TextureBinding>          textures;
 		std::vector<vk::Sampler>             samplers;
 		std::vector<vk::DescriptorImageInfo> pushed_images; // image and sampler descriptors
+		// KYTY_DRAW_RUN_BINDINGS (drawRun.h): the buffer resolutions of the recorded draw, per V#
+		// slot of the vertex and pixel stages, per merged vertex range and for the index buffer: the
+		// guest range an eligible draw resolved and the cache buffer (id with generation, pointer; the
+		// stream buffer for a stream copy) and offset it got. A continuation whose range for a slot is
+		// this range binds {buffer, offset} without the lookup; one inside the cache buffer's bounds
+		// passes the id as the lookup's hint. Valid while bindings_valid (made with the switch on by
+		// a draw this record describes; the record's activity, command and tick pin the run).
+		using Binding = DrawRunBufferBinding;
+		std::vector<Binding>                                       vertex_buffers; // V# slots, stage 0
+		std::vector<Binding>                                       pixel_buffers;  // V# slots
+		std::array<Binding, ShaderVertexInputInfo::RES_MAX>        vertex_ranges {}; // merged ranges
+		uint32_t                                                   vertex_range_count = 0;
+		Binding                                                    index;
+		bool                                                       bindings_valid = false;
 	};
 	// DrawIndex/DrawAuto under the render mutex: the previous run's validity is taken for this draw,
 	// and a draw the draw-prep engine does not commit counts as other command-processor work.
@@ -1448,6 +1472,25 @@ private:
 	                   vk::ImageAspectFlags feedback_aspects,
 	                   std::span<PreparedBindings* const> stages);
 	DrawRunRecord m_run;
+	// KYTY_DRAW_RUN_BINDINGS: the committed draw's merged vertex-range and index-buffer resolutions
+	// (AcquireVertexBuffersInto, PrepareIndexBuffer), taken into the record by DrawRunRecordDraw.
+	std::array<DrawRunBufferBinding, ShaderVertexInputInfo::RES_MAX> m_run_vertex_ranges {};
+	uint32_t                                                        m_run_vertex_range_count = 0;
+	DrawRunBufferBinding                                            m_run_index;
+	// Whether the committed draw's buffer work may take the record's resolutions: a continuation
+	// (m_run_active), the switch on, and a record made with it on (bindings_valid).
+	[[nodiscard]] bool DrawRunBindingsReusable() const;
+	// The record's entry for a slot when it is exactly the requested guest range and its cache
+	// buffer still exists, is the recorded one and covers the range (a stream copy: always, within
+	// the record's tick); else null. Counts a fallback for an entry that exists but fails.
+	[[nodiscard]] const DrawRunBufferBinding* DrawRunReusableBinding(
+	    std::span<const DrawRunBufferBinding> bindings, uint32_t slot, uint64_t vaddr,
+	    uint64_t size) const;
+	// Verify mode (KYTY_DRAW_RUN_BINDINGS=verify|exit): the normal path's resolution of a range a
+	// continuation would have taken from `reused`; a different buffer or offset is a mismatch (a
+	// stream copy: a different buffer only, the copy's offset is new every time).
+	static void DrawRunVerifyBinding(const DrawRunBufferBinding& reused, const Buffer* buffer,
+	                                 uint64_t offset, const char* what);
 	// KYTY_DRAW_RUN_RECALL: earlier records of the instance (DrawRunKeep), whether the committed draw
 	// recalls one, and whether m_run holds a complete record that is kept when it is replaced.
 	[[nodiscard]] bool DrawRunRecallCandidate(const CommandBuffer& buffer, DrawRenderState& state,

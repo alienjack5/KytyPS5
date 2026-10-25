@@ -126,6 +126,12 @@ public:
 	// Budgeted per frame (KYTY_READBACK_EAGER_FLUSHES, default 8; 0 disables).
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+	// The buffer structure epoch (m_bda_structure_epoch): unchanged, every registered cache buffer
+	// still holds the ranges it held, at the same offsets (the binding memo's guard for a cache-buffer
+	// result; KYTY_DRAW_RUN_BINDINGS reuses a recorded resolution only under the epoch it was made).
+	[[nodiscard]] uint64_t BufferStructureEpoch() const noexcept {
+		return m_bda_structure_epoch.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,

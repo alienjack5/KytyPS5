@@ -17,7 +17,8 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
-	if (state.lane_count == 2) {
+	// These reads stay within 32-lane halves of the wave: a split wave's host subgroups.
+	if (HalfWaveHost(state)) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
 	const auto host_target = EmitHostLane(state, target);
@@ -269,9 +270,9 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto resource = ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers,
-		                                            mem.resource);
-		const auto prefix = ctx.state.memory_byte_offsets[resource];
+		(void)ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		// Shader-data byte offsets are per tracked buffer (memory_offset_count == buffers).
+		const auto prefix = ctx.state.memory_byte_offsets[mem.resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -669,6 +670,7 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::SharedAtomicCmpSwap64:
+		case IR::ValueOpcode::SharedAtomicCmpSwap32:
 		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::BufferAtomicSwap32:
 		case IR::ValueOpcode::BufferAtomicSwap64:
@@ -710,9 +712,14 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
                              uint32_t scope) {
 	const auto old = ctx.state.builder.AllocateId();
-	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32) {
-		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
-		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32 ||
+	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap32) {
+		auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap32) {
+			// RDNA2 DS compares DATA and stores DATA2, opposite to BUFFER atomics (upstream e93b4b037).
+			std::swap(desired, comparator);
+		}
 		ctx.state.builder.AddFunction(
 		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
 		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
@@ -1870,9 +1877,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
-	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
-	                                                ConstantU32(state, 0))
-	                                       : lane_guard,
+	                 state.lane_count == 2 || state.split_wave
+	                     ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
+	                              ConstantU32(state, 0))
+	                     : lane_guard,
 	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
@@ -1884,6 +1892,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
+	// A split wave's first active lane may be in the other host subgroup.
+	if (state.split_wave) {
+		return ExchangeWaveValue(state, atomic, source_lane);
+	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), atomic,
@@ -1958,6 +1970,25 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                            ConstantU32(state, mem.offset));
 	const auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	if (const auto* uniform =
+	        IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::UniformBuffers);
+	    uniform != nullptr && std::ranges::binary_search(uniform->resources, mem.resource)) {
+		// KYTY_UNIFORM_BUFFERS: the uniform view shares the storage view's base adjustment, and
+		// the device reads zero past its dword-aligned range (robustBufferAccess2).
+		const auto array_index =
+		    ResourceForDescriptor(state, IR::DescriptorBindingKind::UniformBuffers, mem.resource);
+		const auto element = Binary(
+		    state, spv::OpIAdd, TypeU32(state), index,
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		           state.memory_byte_offsets[mem.resource], ConstantU32(state, 2)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
+		                          pointer, state.uniform_buffer_variable,
+		                          ConstantU32(state, array_index), ConstantU32(state, 0), element);
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer));
+		return;
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
 	const auto element = Binary(
@@ -2065,7 +2096,7 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);
-	if (state.lane_count == 2) {
+	if (HalfWaveHost(state)) {
 		lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
 	}
 	const auto address = ctx.Arg(inst, 1);

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/crashContext.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/guestProbe.h"
@@ -272,6 +273,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 // Returns 0 (rax and xmm0, see the thunk). Reported per import: its first call, then its call
 // count at powers of ten from 1,000 (UnresolvedImportLog).
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_address) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	auto*      record = reinterpret_cast<StubbedImportRecord*>(record_address);
 	const auto call   = record->calls.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (UnresolvedImportLog::ReportFirst(call)) {
@@ -355,9 +357,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "pushq %%r15\n\t"
 		             "movq %%gs:0x08, %%r14\n\t"
 		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
+		             KYTY_GUEST_TEB_STACK_RANGE_ASM("%[teb_range]")
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -372,7 +372,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "popq %%r13\n\t"
 		             "popq %%r12\n\t"
 		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
+		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
+		               [teb_range] "m"(Common::HostException::g_guest_teb_stack_range)
 		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
 		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 		               "xmm12", "xmm13", "xmm14", "xmm15");
@@ -507,7 +508,15 @@ bool TestMainEntryUsesGuestStack() {
 	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
 	             :
 	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	// Zeros, or with KYTY_GUEST_TEB_STACK_RANGE=1 and the host stack above the guest stacks'
+	// region, that region (hostException.h).
+	uintptr_t deallocation_stack = 0;
+	asm volatile("movq %%gs:0x1478, %0" : "=r"(deallocation_stack) : : "memory");
+	const bool teb_range = Common::HostException::g_guest_teb_stack_range != 0 &&
+	                       deallocation_stack >= Common::HostException::GuestStacksHigh;
+	const bool teb_ok =
+	    state.teb_stack_base == (teb_range ? Common::HostException::GuestStacksHigh : 0) &&
+	    state.teb_stack_limit == (teb_range ? Common::HostException::GuestStacksLow : 0) &&
 	                    restored_teb_stack_base == original_teb_stack_base &&
 	                    restored_teb_stack_limit == original_teb_stack_limit;
 #else
@@ -786,6 +795,9 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 #endif
 	const GuestLoad::FaultScope guest_load(guest_code ? info->native_context : nullptr);
 	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (handled) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+	}
 	if (HangTrace::Enabled()) {
 		HangTrace::ClearFaultContext();
 	}
@@ -855,6 +867,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -1541,6 +1554,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
 		}
+	}
+	if (!m_programs.empty()) {
+		GamePatch::ApplyBuiltin(m_programs.front());
 	}
 	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
 		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);

@@ -215,6 +215,9 @@ public:
 	// a frame spans hundreds of scheduler ticks, so tick age alone treats every alias used
 	// earlier in the same frame as stale.
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t Frame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
+	// The image of a slot id, or nullptr when the slot is free (GPU thread).
+	[[nodiscard]] Image* TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	void RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
@@ -508,7 +511,12 @@ private:
 	void               NoteFrameTick(uint64_t frame, uint64_t tick);
 	// Returns the AccountedSize bytes freed (stops past `enough`).
 	uint64_t           RetireUnusedImages(uint64_t frame, uint64_t min_age, size_t max_count,
-	                                      uint64_t enough);
+	                                      uint64_t enough, bool idle_pass = false);
+	// KYTY_VRAM_IDLE_KEEP_POOLS_MB=<n> (default 0: off): the idle pass (KYTY_VRAM_IDLE_FRAMES)
+	// passes over sampled-only one-level texture arrays of n MiB and more while the device budget
+	// is 12 GiB or more; pressure and budget collection still take them.
+	[[nodiscard]] bool KeptIdlePool(const Image& image) const;
+	uint64_t           m_idle_keep_pool_bytes = 0;
 	uint64_t           m_idle_frames          = 0;
 	uint64_t           m_idle_next_frame      = 0;
 	uint64_t           m_idle_freed           = 0;
@@ -605,6 +613,7 @@ private:
 	// DccDecisionEffects (GPU thread).
 	uint64_t         m_dcc_decision_effects = 0;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;
 	bool             m_partial_bands       = true;

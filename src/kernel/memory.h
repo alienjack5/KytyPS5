@@ -15,6 +15,23 @@ namespace Libs::LibKernel::Memory {
 void Initialize();
 void Shutdown();
 
+// Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
+// waits on the GPU; call it only while the memory subsystem is initialized.
+struct DebugStats {
+	uint64_t direct_total        = 0;
+	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t automatic_allocated = 0; // Extended memory.
+	uint64_t direct_mapped       = 0;
+	uint64_t flexible_total      = 0;
+	uint64_t flexible_used       = 0;
+	uint64_t pool_committed      = 0;
+	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries    = 0;
+	uint64_t page_entries_total  = 0; // Per side.
+};
+[[nodiscard]] DebugStats GetDebugStats();
+
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
 	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;
@@ -168,6 +185,8 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// RenderContext::PrepareHostOverwrite (KYTY_APR_PREPARE_WRITE): false when nothing was watched.
+bool                   PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

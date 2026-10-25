@@ -822,7 +822,7 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
-	       db.shader_dual_export_enable || db.shader_execute_on_noop;
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
 }
 
 // One per RenderExecutor, reused by every draw instead of being value-initialised (tens of KB)
@@ -952,7 +952,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		depth.load_clear_aspects = {};
+		if (depth.depth_clear_enable || meta_clear)
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+		// Apply pending clears to compressed stencil as well as depth (upstream 5bf37f52a).
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -1083,9 +1088,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		attachment.depth_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eStencil);
 	}
 	depth_scope.Stop();
 	if (color_count == 0 && !depth.image_id) {
@@ -1189,7 +1196,7 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 	const auto target_mask = hw.GetRenderTargetMask();
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		const auto& rt = hw.GetRenderTarget(slot);
-		if (rt.base.addr == 0 || (slot != 0 && render_target_mask_slot(target_mask, slot) == 0)) {
+		if (!render_target_bound(rt) || (slot != 0 && render_target_mask_slot(target_mask, slot) == 0)) {
 			continue;
 		}
 		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
@@ -1201,7 +1208,9 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 		// single sample.
 		const bool eligible = materialize && (dcc || cmask) &&
 		                      rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
-		                      rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0;
+		                      ((rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0) ||
+		                       (cmask && !dcc && CmaskMsaaEnabled() &&
+		                        rt.attrib.num_samples == rt.attrib.num_fragments));
 		uint64_t image_size = 0;
 		if (eligible) {
 			RenderColorInfo target {};
@@ -1991,7 +2000,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		const auto output_filter = DrawColorOutputFilter(ctx);
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			const auto& rt = ctx.GetRenderTarget(slot);
-			if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+			if (render_target_bound(rt) && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 			    (output_filter & (1u << slot)) != 0) {
 				target_export_mapping[slot] =
 				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
@@ -2060,14 +2069,23 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	CommitStats::Mark(CommitStats::Phase::Programs);
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
-	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
-	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw. A tessellated draw needs
+	// all three vertex stages (one without a runtime made PrepareBindings exit: Wolverine
+	// HS 0x3ff475220c3b4e7b + TES 0xb39fc591165dbc5f).
+	const bool tess_missing =
+	    state.vertex_stages_written == 3u &&
+	    (!state.programs.vertex[1] || !state.programs.vertex[2] || !state.vertex_info[0].stage ||
+	     !state.vertex_info[1].stage || !state.vertex_info[2].stage);
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel) || tess_missing) {
 		// Counted and reported (the first few, then every 2048th) so a dropped draw is never silent.
 		static std::atomic_uint64_t dropped {0};
 		const auto                  count = dropped.fetch_add(1, std::memory_order_relaxed) + 1u;
 		if (count <= 4u || (count & 2047u) == 0u) {
 			std::printf("Warning: draw #%" PRIu64 " dropped, %s program missing (%s)\n", count,
-			            !state.programs.vertex[0] ? "vertex" : "pixel", draw.Name());
+			            !state.programs.vertex[0] ? "vertex"
+			            : tess_missing           ? "tessellation"
+			                                     : "pixel",
+			            draw.Name());
 		}
 		return false;
 	}
@@ -2263,6 +2281,32 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 			state.depth_info = reference;
 		}
 	}
+	// Upstream 7b7294aa0 (TODO PPSA09243): Vulkan passes take one sample count. Where PS5
+	// attachments mix counts, keep those matching the raster count instead of resolving
+	// multisampled shadows. Draws with one sample count (all Astro Bot draws seen) skip this.
+	if (state.color_count != 0 || state.depth_info.image_id) {
+		const auto colors       = std::span {state.color_info, state.color_count};
+		const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
+		                                                    : state.color_info[0].desc.info.samples;
+		if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+			    return color.desc.info.samples != pass_samples;
+		    })) {
+			const auto raster =
+			    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+			const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
+				return color.desc.info.samples != raster;
+			});
+			state.color_count -= static_cast<uint32_t>(dropped.size());
+			if (state.depth_info.image_id && state.depth_info.desc.info.samples != raster) {
+				state.depth_info = {};
+			}
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: dropping attachments whose sample count differs from the raster.\n");
+			}
+		}
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2293,6 +2337,96 @@ static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInf
 		if (binding.kind == Kind::Gds || binding.kind == Kind::FaultBuffer) {
 			return false;
 		}
+	}
+	return true;
+}
+
+// KYTY_PIPELINE_SKIP: whether a draw may be skipped while the driver builds its new pipeline
+// because the picture is all it changes: no stage writes guest memory or images (DrawRunProgramEligible),
+// no guest occlusion query counts its samples, it clears no depth or stencil, it is no mesh draw,
+// and it renders to tiled images only (the CPU reads linear ones back).
+// KYTY_PIPELINE_SKIP_RECURRENT (default on): a skipped draw is lost for good when its target is
+// not drawn again, e.g. a sky or probe texture rendered once at level start (Sky Garden's sky
+// stayed black after a shader-cache invalidation). Only draws whose every target was already a
+// render target in at least two earlier presented frames may be skipped; the others wait.
+static bool SkipRecurrentTargetsOnly() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_RECURRENT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+// Notes the draw's render targets for the rule above (once per image and frame).
+static void NoteSkipTargets(RenderContext& context, const DrawRenderState& state) {
+	auto&      cache = context.GetTextureCache();
+	const auto frame = cache.Frame() + 1u; // 0 = never
+	const auto note  = [&](ImageId id) {
+		if (!id) {
+			return;
+		}
+		auto* image = cache.TryGetImage(id);
+		if (image != nullptr && image->skip_target_frame != frame) {
+			image->skip_target_frame  = frame;
+			image->skip_target_frames = std::min<uint32_t>(image->skip_target_frames + 1u, 1000u);
+		}
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		note(state.color_info[i].image_id);
+	}
+	note(state.depth_info.image_id);
+}
+
+static bool TargetsRecurrent(RenderContext& context, const DrawRenderState& state) {
+	auto&      cache     = context.GetTextureCache();
+	const auto frame     = cache.Frame() + 1u;
+	const auto recurrent = [&](ImageId id) {
+		if (!id) {
+			return true;
+		}
+		const auto* image = cache.TryGetImage(id);
+		if (image == nullptr) {
+			return false;
+		}
+		// Earlier frames only: the current frame was noted before this check.
+		const auto earlier = image->skip_target_frames - (image->skip_target_frame == frame ? 1u : 0u);
+		return earlier >= 2u;
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!recurrent(state.color_info[i].image_id)) {
+			return false;
+		}
+	}
+	return recurrent(state.depth_info.image_id);
+}
+
+static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
+                                   std::span<const ShaderVertexInputInfo> vertex_stages, bool mesh_active) {
+	if (mesh_active || vertex_stages.size() != 1 || context.GetOcclusionCounter().Active()) {
+		return false;
+	}
+	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state)) {
+		return false;
+	}
+	for (const auto& stage: vertex_stages) {
+		if (stage.stage.program == nullptr || !DrawRunProgramEligible(*stage.stage.program)) {
+			return false;
+		}
+	}
+	if (state.ps_active && (state.ps_input_info.stage.program == nullptr ||
+	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program))) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!state.color_info[i].desc.info.IsTiled()) {
+			return false;
+		}
+	}
+	const auto& depth = state.depth_info;
+	if (static_cast<bool>(depth.image_id) &&
+	    (!depth.desc.info.IsTiled() || depth.depth_clear_enable || depth.load_clear_aspects ||
+	     depth.stencil_clear_enable)) {
+		return false;
 	}
 	return true;
 }
@@ -3500,7 +3634,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     state.ps_input_info.ps_sample_mask_export_enable);
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
-	if (depth.depth_load_clear_enable) {
+	if (depth.load_clear_aspects) {
 		m_context.GetCommandScheduler().BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
@@ -4089,6 +4223,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 		}
 	}
+	// KYTY_REBIND_AFTER_JOIN: a buffer the bindings resolved was retired since (a later lookup of
+	// this draw - another binding, a vertex, index or argument range - joined it into a new
+	// buffer): the recorded draw would read and write a buffer nothing uses again, its writes lost
+	// while the range stays GPU-owned. Resolve the buffers and the per-draw ranges again while the
+	// count moves (at most 4 times).
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("draw", draw.Name());
+			m_rebind_epoch = cache.UnregisterEpoch();
+			{
+				const BufferCache::UploadBatch upload_batch(cache);
+				for (auto* stage: stages) {
+					RebindBuffers(*stage);
+				}
+			}
+			if (!mesh_active) {
+				vertex_bindings = PreparedVertexBuffers {};
+				if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+					AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+				} else {
+					vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
+				}
+				index_binding = PrepareIndexBuffer(buffer, index_source);
+			}
+			if (indirect != nullptr) {
+				indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+			}
+		}
+	}
 	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
 	// path's own texture resolution ran before it here). A draw that would have fallen back is
 	// not compared.
@@ -4133,6 +4297,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// built for and no pipeline was replaced since (DrawPrep::PlannedPipeline).
 	auto&       pipeline_cache = m_context.GetPipelineCache();
 	const auto  colors_span    = std::span<const RenderColorInfo> {state.color_info, state.color_count};
+	if (pipeline_cache.PipelineSkipEnabled() && SkipRecurrentTargetsOnly()) {
+		NoteSkipTargets(m_context, state);
+	}
 	const auto* ps_input       = state.ps_active ? &state.ps_input_info : nullptr;
 	const auto* planned_pipeline =
 	    plan_stages && plan->pipeline != nullptr
@@ -4143,9 +4310,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
+		const bool skippable = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled() &&
+		                       DrawOnlyChangesPicture(m_context, state, vertex_stages, mesh_active);
+		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
-		    primitive_restart_enable, *programs);
+		    primitive_restart_enable, *programs, skippable);
+		if (pipeline_object == nullptr) {
+			// KYTY_PIPELINE_SKIP: skipped until its pipeline is built. Nothing was recorded; no
+			// draw-run record may be continued or recalled across it (its bindings replaced the
+			// record's).
+			m_run.valid        = false;
+			m_run_active       = false;
+			m_run_targets_kept = false;
+			for (auto& record: m_run_kept) {
+				record.valid = false;
+			}
+			return;
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
@@ -4409,6 +4590,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
 	                      state.vertex_info[0].mesh.split_groups != 0)
 	                : 0u;
+	// PA_CL_UCP planes (upstream feed075a9): four float dwords per plane up to the highest enabled.
+	if (const auto planes = state.vertex_info[0].user_clip_planes; planes != 0) {
+		uint32_t count = 0;
+		for (uint32_t mask = planes; mask != 0; mask >>= 1u) {
+			count++;
+		}
+		vk_buffer.pushConstants(
+		    pipeline.pipeline_layout,
+		    vk::ShaderStageFlagBits::eFragment |
+		        (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex),
+		    ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
+		    count * 4u * sizeof(uint32_t), buffer.GetRegisters().GetUserClipPlanes().data());
+	}
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups). Indirect draws are

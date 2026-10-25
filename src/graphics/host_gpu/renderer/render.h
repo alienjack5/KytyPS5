@@ -76,6 +76,9 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// KYTY_ORDERED_APPEND (renderCompute.cpp).
+[[nodiscard]] bool OrderedAppendSplitEnabled();
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -921,6 +924,14 @@ public:
 			m_owner->m_buffer.dispatch(x, y, z);
 		}
 	}
+	void dispatchBase(uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y,
+	                  uint32_t z) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->dispatchBase(bx, by, bz, x, y, z);
+		} else {
+			m_owner->m_buffer.dispatchBase(bx, by, bz, x, y, z);
+		}
+	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->dispatchIndirect(buffer, offset);
@@ -975,6 +986,17 @@ public:
 			m_owner->m_buffer.writeBufferMarkerAMD(stage, buffer, offset, marker);
 		}
 	}
+	// KYTY_STREAM_COPY_DEFER: encodes a host copy of guest bytes for the recorder thread (in stream
+	// order, before the next Submit). False (nothing encoded) outside recorder encoding (recorder
+	// off or a direct window open): the caller then copies itself. Not a command: construct the
+	// sink directly (CommandSink(buffer)); Sink() would also flush the barrier batch.
+	[[nodiscard]] bool hostCopy(void* destination, uint64_t source, uint64_t size) const {
+		if (!m_owner->Encoding()) {
+			return false;
+		}
+		m_owner->m_encoder->hostCopy(destination, source, size);
+		return true;
+	}
 
 private:
 	const CommandBuffer* m_owner;
@@ -1019,6 +1041,10 @@ struct GraphicsDynamicStateShadow {
 	bool                 depth_bounds_valid       = false;
 	std::array<float, 2> depth_bounds {};
 };
+
+// KYTY_REBIND_AFTER_JOIN (descriptors.cpp).
+[[nodiscard]] bool RebindAfterJoinEnabled();
+void               NoteRebindAfterJoin(const char* kind, const char* name);
 
 class RenderExecutor {
 public:
@@ -1510,6 +1536,7 @@ private:
 	bool                         m_run_keepable  = false;
 	bool          m_run_prev_valid     = false; // m_run.valid when the committed draw began
 	bool          m_run_active         = false; // the draw takes the delta path
+	uint64_t      m_rebind_epoch       = 0;     // KYTY_REBIND_AFTER_JOIN: UnregisterEpoch at resolution
 	bool          m_run_verify         = false; // verify mode: the draw would have continued
 	uint64_t      m_run_key            = 0;     // the committed draw's structure key (the engine)
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)

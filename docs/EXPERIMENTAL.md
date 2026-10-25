@@ -279,7 +279,8 @@ From int5 (`u59-windows-20261003-int5`):
     queries (`KYTY_RECORDER_DESCRIPTOR_SETS`, `KYTY_PUSH_SHADOW_FRESH_SKIP`, `KYTY_META_CLEAR_MEMO`,
     `KYTY_PENDING_REFRESH_US`).
 - Lower VRAM use, also behind preset flags:
-  - sparse residency for partially resident textures and for the BDA page table;
+  - sparse residency for partially resident textures (`KYTY_TEXTURE_SPARSE_RESIDENCY=auto`: only on cards that
+    report less than 15 GiB of VRAM, the 16 GB class and up keep full mip chains) and for the BDA page table;
   - idle limits for the native image pool and the tiler scratch pool;
   - images unused for 600 frames are freed.
 - Upstream KytyPS5 changes up to the first sync: controller, audio and compatibility fixes, and the layered VideoOut
@@ -330,6 +331,13 @@ peak`), split into the emulator's packets ("library") and the game's own data ("
 crash report also prints the 64 bytes at each register that points to memory; for this crash `[rbx]` is the full
 buffer's state. Send the console text from the last summary line on. The diagnostic costs a little speed.
 
+Since the 2026-10-22 fix the emulator doubles these buffers for Astro Bot 01.018.000 before the game starts
+(`KYTY_ASTRO_CB_SCALE`, default `2`; `1` keeps the game's sizes, `3`/`4` scale further; the console prints
+`Game patch: Astro Bot draw-thread command buffers x2`). The game's Draw Geometry thread uploads its mesh-deformer bone
+palettes into this buffer; when the thread falls a frame behind, one buffer takes two frames of that work (about
+11.5 MiB in speedrun_inflator, where 7 MiB ran full on every boot). On dual-CCD X3D processors the game's threads now
+also use the second CCD (`KYTY_VCACHE_GUEST=all`, default; `hot` keeps them on the V-cache CCD as in int19.3-int20).
+
 ## Caveats
 
 - Program caches are reused only from a build with the same shader translation. Otherwise the first launch of each
@@ -359,7 +367,7 @@ Release with Ninja in an x64 Visual Studio developer shell, as in `.github/workf
 - Configure from `C:\kyty-src19`, a directory junction to the checkout (`mklink /J C:\kyty-src19 <checkout>`, then
   `cmake -S C:\kyty-src19 -B <new build directory>`). clang-cl names functions in anonymous namespaces after a hash
   of the source path, so a build from any other path loses their part of the profile.
-- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src19/tools/pgo/u59-int194-1.profdata`. Without
+- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src19/tools/pgo/u59-int21-1.profdata`. Without
   `KYTY_PGO_USE` the build works, but without the profile's speedup.
 - Add `-DKYTY_CP_DIAGNOSTICS=OFF`, as the release does: it compiles out the command processor's per-draw
   developer statistics (`KYTY_CP_COMMIT_STATS`, `KYTY_BUFFER_LOOKUP_STATS`, which are then ignored). The hang

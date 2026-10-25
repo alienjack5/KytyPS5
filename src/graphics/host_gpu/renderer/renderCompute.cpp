@@ -1,3 +1,4 @@
+#include "common/debugCounters.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -34,6 +35,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <tuple>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -348,6 +350,18 @@ bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, Prepare
 	return true;
 }
 
+// KYTY_ORDERED_APPEND=1 (default off; upstream d4465faa7): a dispatch with
+// DISPATCH_INITIATOR.ORDERED_APPEND_ENABLE whose program uses GDS and whose workgroups are one
+// guest wave without emulated LDS runs one workgroup per vkCmdDispatchBase, in launch order with a
+// barrier between them, so ordered-append counters see the workgroups in order. Logged once.
+bool OrderedAppendSplitEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_ORDERED_APPEND");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -522,7 +536,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
 	RebindImages(bindings);
 	BindComputeLds(input_info, bindings, input_info.workgroup_counts);
+	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
 	RebindBuffers(bindings);
+	// KYTY_REBIND_AFTER_JOIN: a later binding's lookup joined a buffer an earlier one resolved.
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("dispatch", nullptr);
+			m_rebind_epoch = cache.UnregisterEpoch();
+			RebindBuffers(bindings);
+		}
+	}
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 
 	PreparedBindings* descriptor_stage = &bindings;
@@ -616,7 +640,33 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	constexpr uint32_t DispatchInitiatorOrderedAppendEnable = 1u << 3u;
+	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
+	                               std::max(input_info.threads_num[1], 1u) *
+	                               std::max(input_info.threads_num[2], 1u);
+	if (OrderedAppendSplitEnabled() && (mode & DispatchInitiatorOrderedAppendEnable) != 0 &&
+	    (ShaderRecompiler::IR::FindBinding(program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) && group_threads <= input_info.wave_size && !input_info.lds_storage) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			std::printf("KYTY_ORDERED_APPEND: shader 0x%016" PRIx64
+			            " runs %ux%ux%u ordered-append workgroups one by one\n",
+			            program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
+			std::fflush(stdout);
+		}
+		for (uint32_t z = 0; z < thread_group_z; ++z) {
+			for (uint32_t y = 0; y < thread_group_y; ++y) {
+				for (uint32_t x = 0; x < thread_group_x; ++x) {
+					if ((x | y | z) != 0u) {
+						ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+					}
+					buffer.Sink().dispatchBase(x, y, z, 1, 1, 1);
+				}
+			}
+		}
+	} else {
+		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -769,10 +819,23 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindComputeLds(input_info, bindings, nullptr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
+	auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("indirect dispatch", nullptr);
+			m_rebind_epoch               = cache.UnregisterEpoch();
+			std::tie(args_buffer, args_offset) =
+			    cache.ObtainBuffer(args_addr, sizeof(vk::DispatchIndirectCommand), false);
+			EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+			RebindBuffers(bindings);
+		}
+	}
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
@@ -810,6 +873,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);

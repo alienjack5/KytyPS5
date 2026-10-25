@@ -565,7 +565,7 @@ if (WIN32 AND KYTY_AFTERMATH_SDK AND EXISTS "${KYTY_AFTERMATH_SDK}/include/GFSDK
 	message(STATUS "Nsight Aftermath: GPU crash dumps available (KYTY_AFTERMATH=1), SDK ${KYTY_AFTERMATH_SDK}")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static OpenXR::openxr_loader)
 
 # Linux system libraries.
 if(LINUX)
@@ -579,7 +579,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -649,6 +649,7 @@ add_executable(lane_local_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/LaneLocal.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 )
 target_link_libraries(lane_local_tests fmt::fmt)
 target_include_directories(lane_local_tests PRIVATE ${inc_headers})
@@ -747,6 +748,17 @@ target_link_libraries(live_switch_tests common)
 target_include_directories(live_switch_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(live_switch_tests Threads::Threads)
+endif()
+
+# KYTY_GUEST_PROBE (common/guestProbe.h): probes retiring while other threads run through them, and a
+# deferred probe sharing a normal probe's address.
+add_executable(guest_probe_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestProbeTests.cpp"
+)
+target_link_libraries(guest_probe_tests common)
+target_include_directories(guest_probe_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(guest_probe_tests Threads::Threads)
 endif()
 
 add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
@@ -863,6 +875,10 @@ add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/imeDialog.cpp"
 )
 target_include_directories(ime_dialog_tests PRIVATE ${inc_headers})
+
+add_executable(range_set_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RangeSetTests.cpp")
+target_link_libraries(range_set_tests common)
+target_include_directories(range_set_tests PRIVATE ${inc_headers})
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryTrackerTests.cpp"
@@ -1168,7 +1184,8 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests lane_local_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_recompiler_compute_tests pipeline_compile_queue_tests)
+			virtual_memory_allocation_tests shader_recompiler_compute_tests pipeline_compile_queue_tests
+			range_set_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -1236,6 +1253,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-pressure-retirement-only)
 	add_test(NAME present_box_downscale
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
+	add_test(NAME range_set COMMAND $<TARGET_FILE:range_set_tests>)
 	add_test(NAME image_gpu_keep_device
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -1260,6 +1278,10 @@ if(BUILD_TESTING)
 	add_test(NAME cpu_placement_vcache_pending
 	         COMMAND $<TARGET_FILE:cpu_placement_tests> --vcache pending)
 	add_test(NAME live_switch COMMAND $<TARGET_FILE:live_switch_tests>)
+	add_test(NAME guest_probe_retire COMMAND $<TARGET_FILE:guest_probe_tests>)
+	add_test(NAME guest_probe_shared COMMAND $<TARGET_FILE:guest_probe_tests> --shared)
+	add_test(NAME guest_probe_equals COMMAND $<TARGET_FILE:guest_probe_tests> --equals)
+	set_tests_properties(guest_probe_retire guest_probe_shared guest_probe_equals PROPERTIES TIMEOUT 60)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
 	add_test(NAME u59_preset COMMAND $<TARGET_FILE:u59_preset_tests>)
@@ -1378,6 +1400,8 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_tessellation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -2311,6 +2335,11 @@ if(BUILD_TESTING)
 	# stay in the build directory, so later runs start warm).
 	add_test(NAME program_cache
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	# The compute cases compiled on several threads at once, from fresh and from shared copied
+	# translations (the precompile replay's pattern), against single-threaded compiles; no
+	# compiled program may name an instruction specialization made dead (CPU only).
+	add_test(NAME shader_parallel_compile
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --parallel-compile-only)
 	add_test(NAME program_cache_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
 	add_test(NAME program_cache_gpu_verify
@@ -2476,6 +2505,8 @@ if(BUILD_TESTING)
 		image_clear_range_tests
 		image_gpu_keep_tests
 		clear_register_decode_tests
+		range_set_tests
+		guest_probe_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests

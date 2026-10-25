@@ -49,6 +49,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -69,6 +70,7 @@
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -2154,7 +2156,13 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
     }
     offset += words.size();
   }
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  // KYTY_TEST_SKIP_SPIRV_TEXT=1: run the cases under codegen switches whose SPIR-V the text
+  // expectations do not describe (e.g. KYTY_WAVE64_WARPS=1), keeping only the result checks.
+  static const bool skip_text = [] {
+    const char *value = std::getenv("KYTY_TEST_SKIP_SPIRV_TEXT");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (skip_text || (test.required_spirv.empty() && test.forbidden_spirv.empty())) {
     return;
   }
 
@@ -2351,8 +2359,16 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(translated.program) == 0,
+          "the translation's plan tables name instructions it does not have");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  // Specialization can make instructions the plan tables name dead (a zero-stride buffer read's
+  // descriptor); CompileProgram must clear those references before a pass reads them.
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(result.program) == 0,
+          "the compiled program's plan tables name instructions it does not have");
   copy_check.Verify(test.name, options, specialization, result);
   cache_check.Verify(options, runtime, resources, specialization, result);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -2789,8 +2805,16 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(translated.program) == 0,
+          "the translation's plan tables name instructions it does not have");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  // Specialization can make instructions the plan tables name dead (a zero-stride buffer read's
+  // descriptor); CompileProgram must clear those references before a pass reads them.
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(result.program) == 0,
+          "the compiled program's plan tables name instructions it does not have");
   copy_check.Verify(test.name, options, specialization, result);
   cache_check.Verify(options, runtime, resources, specialization, result);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
@@ -24056,6 +24080,39 @@ public:
               "bytes");
       // Return the range to the CPU before the unmap below.
       cache.ReadMemory(base, upload_size, false);
+
+      // KYTY_UPLOAD_DMA_WRITE_DRAIN: a command-processor write that follows an upload in the
+      // command stream waits until the worker has copied the bytes it overwrites, so the upload
+      // keeps the bytes from before the write.
+      Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=1\n");
+      Live::OnCpFlip();
+      Require(name, "write drain on", UploadDmaWriteDrainEnabled(),
+              "KYTY_UPLOAD_DMA_WRITE_DRAIN did not switch on");
+      std::vector<uint32_t> before_write(upload_size / sizeof(uint32_t));
+      for (uint64_t i = 0; i < before_write.size(); i++) {
+        before_write[i] = static_cast<uint32_t>(i * 0x85ebca6bu + 0x77u);
+      }
+      Require(name, "guest write 2", context.InvalidateMemory(base, upload_size),
+              "the re-dirtied range is not mapped");
+      Libs::LibKernel::Memory::WriteBacking(base, before_write.data(), upload_size);
+      dma->HoldWorkerForTest(true);
+      const auto [third, third_offset] = cache.ObtainBuffer(base, upload_size, false, false);
+      std::thread release([dma] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        dma->HoldWorkerForTest(false);
+      });
+      const bool waited = dma->DrainHostCopies(base + 64, sizeof(uint32_t));
+      const bool copied = dma->HostCopyBytesDone() == dma->HostCopyBytesQueued();
+      const uint32_t later = 0xdeadbeefu;
+      Libs::LibKernel::Memory::WriteBacking(base + 64, &later, sizeof(later));
+      release.join();
+      const bool unrelated = !dma->DrainHostCopies(base + upload_size + 64, sizeof(uint32_t));
+      const auto third_words = read_back(third->Handle(), third_offset, upload_size);
+      Require(name, "write drain",
+              waited && copied && unrelated && third_words[16] == before_write[16],
+              "a CP write after a queued upload did not wait for its host copy, or leaked into it");
+      Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=\n");
+      Live::OnCpFlip();
     }
 
     // A private ring of 1 MiB. The cache's dependency slot is borrowed and restored.
@@ -26029,7 +26086,7 @@ public:
               phased_rendering.num_color_attachments == 0 &&
               phased_rendering.depth_stencil_attachment.has_depth &&
               phased_rendering.depth_stencil_attachment.depth_clear &&
-              phased_depth.depth_load_clear_enable &&
+              static_cast<bool>(phased_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) &&
               texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.IsMetaCleared(
                   phased_depth.desc.info.metadata.range.address,
@@ -26211,7 +26268,7 @@ public:
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
-                    bounds_depth.depth_load_clear_enable == (pass == 0) &&
+                    static_cast<bool>(bounds_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
                     bounds_feedback == (pass == 0
                                             ? vk::ImageAspectFlagBits::eDepth
@@ -55640,12 +55697,12 @@ void CheckDepthAttachmentWrites() {
 
   target.depth_test_enable = false;
   target.depth_write_enable = false;
-  target.depth_load_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DepthAttachmentWrites", "depth clear",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eDepth,
           "depth attachment clear did not claim depth");
 
-  target.depth_load_clear_enable = false;
+  target.load_clear_aspects = {};
   target.stencil_test_enable = true;
   target.stencil_front = {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
                           vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0xff, 0xff, 0};
@@ -55672,6 +55729,7 @@ void CheckDepthAttachmentWrites() {
 
   target.stencil_test_enable = false;
   target.stencil_clear_enable = true;
+  target.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
   Require("DepthAttachmentWrites", "stencil clear",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
           "stencil attachment clear did not claim stencil");
@@ -55745,12 +55803,13 @@ void CheckDepthFeedbackAspects() {
           feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
           "overlapping mip and layer boundaries missed depth feedback");
   target.depth_write_enable = false;
-  target.depth_load_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DepthFeedbackAspects", "depth clear only",
           feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
           "a sampled depth attachment clear missed feedback");
-  target.depth_load_clear_enable = false;
+  target.load_clear_aspects = {};
   target.stencil_clear_enable = true;
+  target.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
   sampled.aspect = vk::ImageAspectFlagBits::eStencil;
   Require("DepthFeedbackAspects", "stencil clear only",
           feedback(sampled) == vk::ImageAspectFlagBits::eStencil,
@@ -55804,7 +55863,7 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
           "fully read-only depth/stencil used a writable layout");
-  attachment.depth_load_clear_enable = true;
+  attachment.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DynamicRenderingState", "deferred depth clear layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
@@ -55815,9 +55874,10 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
           "depth-only writes did not retain read-only stencil");
-  attachment.depth_load_clear_enable = false;
+  attachment.load_clear_aspects = {};
   attachment.depth_write_enable = false;
   attachment.stencil_clear_enable = true;
+  attachment.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
   Require("DynamicRenderingState", "depth-read stencil-write layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
@@ -58090,6 +58150,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderBvhTests.inc"
 #include "ShaderBdaWriteTests.inc"
 #include "ShaderIsaAuditTests.inc"
+#include "ShaderParallelCompileTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -58123,8 +58184,19 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized();
     return ProgramCacheTests::CorpusProgramCache(argv[2]);
   }
+  // CPU only (--journal-compile <shaders.journal> [threads]): every permutation of a shader
+  // journal compiled once, then on several threads (ShaderParallelCompileTests.inc).
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--journal-compile") == 0) {
+    EnsureConfigInitialized();
+    const auto threads = argc == 4 ? static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 0)) : 8u;
+    return ParallelCompileTests::JournalCompile(argv[2], std::clamp(threads, 1u, 64u));
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--parallel-compile-only") == 0) {
+    ParallelCompileTests::CheckParallelCompile();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-codegen-only") == 0) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();

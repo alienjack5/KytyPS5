@@ -157,7 +157,7 @@ static bool RenderTargetMaskHasBoundMrt(const HW::Context& hw) {
 
 	uint32_t bound_targets = 0;
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && render_target_bound(hw.GetRenderTarget(i))) {
 			bound_targets++;
 		}
 	}
@@ -168,12 +168,16 @@ static bool RenderTargetMaskHasBoundMrt(const HW::Context& hw) {
 static uint32_t RenderTargetFirstBoundSlot(const HW::Context& hw) {
 	const auto mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && render_target_bound(hw.GetRenderTarget(i))) {
 			return i;
 		}
 	}
 
 	return 0;
+}
+
+bool render_target_bound(const HW::RenderTarget& rt) {
+	return rt.base.addr != 0 && rt.info.format != Prospero::ChannelLayout::kInvalid;
 }
 
 uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
@@ -475,7 +479,7 @@ template <typename P>
 static void ClipCheck(P& p, const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	KYTY_CHECK_EXIT(p, c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
+	KYTY_CHECK_EXIT(p, c.user_clip_plane_mode != 0 ||
 	                       c.vertex_kill_any || c.user_clip_plane_negate_y ||
 	                       c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
 	                       c.force_viewport_index_from_vs_enable);

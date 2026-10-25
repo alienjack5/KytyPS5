@@ -234,6 +234,10 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	// Through the dispatcher, so the KYTY_CMD_GUARD hooks (installed before the allocator) see
+	// the destruction of buffers and images; without the guard these are the driver's entries.
+	functions.vkDestroyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer;
+	functions.vkDestroyImage  = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
@@ -769,6 +773,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		}
 	}
 	return usage;
+}
+
+uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto count = physical_device_memory_properties.memoryHeapCount;
+	for (uint32_t heap = 0; heap < count; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		heaps[heap] = {.usage        = budgets[heap].usage,
+		               .budget       = budgets[heap].budget,
+		               .allocations  = budgets[heap].statistics.allocationCount,
+		               .device_local = static_cast<bool>(properties.flags &
+		                                                 vk::MemoryHeapFlagBits::eDeviceLocal)};
+	}
+	return count;
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {

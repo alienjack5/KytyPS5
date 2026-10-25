@@ -1013,8 +1013,15 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// RemoveIdentities erases identities that the plan tables may still name (with live values).
+	(void)IR::ResolvePlanIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// What specialization made dead may still be named by the plan tables (a zero-stride buffer
+	// read's descriptor): clear those references before anything reads them. Exec-select
+	// elimination walks every plan value; it read freed instructions here, which crashed when
+	// another compile thread had reused their memory (the parallel precompile replay).
+	(void)IR::DropDeadPlanReferences(ir);
 
 	if (GetCodegenOptions().exec_selects) {
 		// One lane per host invocation: the emitter branches per invocation (see BranchCondition).

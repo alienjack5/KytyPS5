@@ -101,6 +101,28 @@ struct CodegenOptions {
 	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
 	// min/max instead of one compare-and-select plus a single two-zeros test.
 	bool fast_float_min_max = true;
+	// KYTY_NATIVE_FMINMAX=1 (EmK530/KytyPS5 d6825f587): with KYTY_FAST_FMINMAX, f32 min/max become
+	// GLSL NMin/NMax. They return the other operand for one NaN like the guest, but leave which
+	// zero min/max(-0, +0) returns unspecified and may treat denormals differently from the
+	// guest's compare (see EmitFastMinMaxF32), so this stays opt-in.
+	bool native_float_min_max = false;
+	// KYTY_DCACHE_INV=1 (default off; upstream 22ef16a04): BUFFER_GL0_INV/GL1_INV emit a device
+	// acquire barrier and make the program's storage buffers coherent (slower memory access).
+	bool dcache_invalidate = false;
+	// KYTY_READFIRSTLANE_EXEC0=1 (default off; upstream 919fac13d): V_READFIRSTLANE with EXEC
+	// zero reads lane 0 (FindILsb + select) instead of BallotFindLSB's undefined lane.
+	bool readfirstlane_exec_zero = false;
+	// KYTY_UNIFORM_BUFFERS=1 (EmK530/KytyPS5 407de5105): bind constant-only buffers as uniform
+	// buffers instead of storage buffers (IR::UniformBufferResources). Off by default: neutral in
+	// Miles Morales on an RTX 3090 (GPU busy within noise), and on NVIDIA's 16-byte uniform
+	// robustness granularity a read just past a V#'s end may return data instead of 0.
+	bool uniform_buffers = false;
+	// KYTY_WAVE64_WARPS=1 (EmK530/KytyPS5 420fc4ead): a wave64 compute program whose workgroup is
+	// the one wave runs on a 32-wide host as two host subgroups, one guest lane per invocation,
+	// instead of two lanes per invocation (Spirv::SplitWaveEligible). Cross-lane operations
+	// exchange the halves through workgroup memory; a branch whose region holds no exchange or
+	// barrier is decided by each half on its own lanes. KYTY_LANE_LOCAL programs stay as they are.
+	bool wave64_warps = false;
 	// KYTY_FAST_PKRTZ=0: convert V_CVT_PKRTZ_F16_F32 halves with the original select chain instead
 	// of the shorter integer formulation.
 	bool fast_pkrtz = true;
@@ -193,6 +215,13 @@ struct CodegenOptions {
 	// indirect V#) access is Volatile, not only MUBUF accesses with GLC/DLC. A guest loop that polls
 	// memory written by another workgroup or queue then rereads it instead of a cached or hoisted value.
 	bool volatile_loads = false;
+	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
+	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
+	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared
+	// "every lane discarded: null export, s_endpgm" tail from inside nested selections, which made
+	// the region of the outer selection externally entered (Wolverine's 0x09161b28ae4039bb). The
+	// copies run the same instructions; nothing after them can tell them apart.
+	bool cfg_clone_exits = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -384,6 +413,11 @@ inline constexpr uint32_t LoopGuardHashGdsFromEnd = RtNodeStatsGdsFromEnd + RtNo
 // it once; false until then, which keeps lane-local programs off).
 void               SetHostComputeSubgroups32(bool fixed_32);
 [[nodiscard]] bool GetHostComputeSubgroups32();
+// KYTY_UNIFORM_BUFFERS needs a device that reads 0 for a uniform dword past the bound range
+// (Spirv::HostBufferRobustness::uniform_dword_loads_return_zero, mirrored here by
+// Spirv::SetHostBufferRobustness for IR::UniformBufferResources).
+void               SetHostUniformBufferRobust(bool robust);
+[[nodiscard]] bool GetHostUniformBufferRobust();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
 void SetCodegenOptions(const CodegenOptions& options);

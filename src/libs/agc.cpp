@@ -332,6 +332,11 @@ static void EndFrame(State* s) {
 			std::fflush(stdout);
 		}
 	}
+	// Diagnostic (astrocrash): frames with more inline 24 KiB blocks than the usual 48.
+	if (s->frame_blocks > 48) {
+		std::printf("Agc cb watermark: buffer %p frame %" PRIu64 ": %" PRIu64 " game blocks of 24 KiB, %.2f MiB\n",
+		            s->bottom, s->frames, s->frame_blocks, Mib(s->frame_up + s->frame_down));
+	}
 	s->max_calls    = std::max(s->max_calls, s->frame_calls);
 	s->max_blocks   = std::max(s->max_blocks, s->frame_blocks);
 	s->prev_calls   = s->frame_calls;
@@ -397,7 +402,7 @@ static void Note(const void* bottom, const void* top, const void* cursor_up,
 	s->frame_up   = std::max(s->frame_up, up);
 	s->frame_down = std::max(s->frame_down, down);
 	// A frame that passes 75 % is reported while it runs: an overflowing frame never ends.
-	if (!s->alarmed && (up + down) * 4 > s->capacity * 3) {
+	if (!s->alarmed && ((up + down) * 4 > s->capacity * 3 || s->frame_blocks >= 64)) {
 		s->alarmed = true;
 		std::printf("Agc cb watermark: buffer %p (%.2f MiB) frame %" PRIu64 " passed 75%%: library "
 		            "%.2f MiB, game %.2f MiB, %" PRIu64 " library calls, %" PRIu64
@@ -865,7 +870,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* front,
+int KYTY_SYSV_ABI AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
                                                const Shader* back) {
 	PRINT_NAME();
 
@@ -1634,14 +1639,6 @@ int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shade
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t addr = 0x%016" PRIx64 "\n"
-		     "\t cmd  = 0x%016" PRIx64 "\n"
-		     "\t type = %d\n",
-		     reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(cmd), type);
-	}
-
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
 
 	if (type != 0) {
@@ -1658,20 +1655,10 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	const bool                   should_log = (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64);
-	if (should_log) {
-		LOGF("\t range = 0x%016" PRIx64 "\n"
-		     "\t cmd   = 0x%016" PRIx64 "\n"
-		     "\t type  = %d\n",
-		     reinterpret_cast<uint64_t>(range), reinterpret_cast<uint64_t>(cmd), type);
-	}
-
 	EXIT_NOT_IMPLEMENTED(range == nullptr);
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	const auto cmd_id = cmd[0];
-	const auto len    = KYTY_PM4_LEN(cmd_id);
 
 	if (type != 0) {
 		range->m_base = cmd + 2;
@@ -1684,13 +1671,6 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 			range->m_base = cmd + 1;
 			range->m_size = static_cast<uint64_t>((cmd_id >> 14u) & 0xfffcu) + sizeof(uint32_t);
 		}
-	}
-
-	if (should_log) {
-		LOGF("\t cmd_id = 0x%08" PRIx32 ", len = %" PRIu32 "\n"
-		     "\t base   = 0x%016" PRIx64 "\n"
-		     "\t size   = 0x%016" PRIx64 "\n",
-		     cmd_id, len, reinterpret_cast<uint64_t>(range->m_base), range->m_size);
 	}
 
 	return OK;
@@ -1941,15 +1921,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
                                       uint32_t modifier) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t thread_group_x = %" PRIu32 "\n"
-		     "\t thread_group_y = %" PRIu32 "\n"
-		     "\t thread_group_z = %" PRIu32 "\n"
-		     "\t modifier       = 0x%08" PRIx32 "\n",
-		     thread_group_x, thread_group_y, thread_group_z, modifier);
-	}
-
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -2057,16 +2028,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
                                                       const uint32_t* values, uint32_t num_values) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t buf        = 0x%016" PRIx64 "\n"
-		     "\t offset     = %" PRIx32 "\n"
-		     "\t values     = 0x%016" PRIx64 "\n"
-		     "\t num_values = %" PRIu32 "\n",
-		     reinterpret_cast<uint64_t>(buf), offset, reinterpret_cast<uint64_t>(values),
-		     num_values);
-	}
-
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
 	auto* cmd = buf->AllocateDW(num_values + 2);
@@ -2097,12 +2058,6 @@ uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values)
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
                                                   const volatile ShaderRegister* regs,
                                                   uint32_t                       num_regs) {
-	PRINT_NAME();
-
-	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	     "\t num_regs = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(regs), num_regs);
-
 	if (num_regs == 0) {
 		return nullptr;
 	}
@@ -2251,23 +2206,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
                                         uint64_t data, uint16_t gds_offset, uint16_t gds_size,
                                         uint8_t interrupt, uint32_t interrupt_ctx_id) {
 	PRINT_NAME();
-
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t action           = 0x%02" PRIx8 "\n"
-		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
-		     "\t dst              = %" PRIu8 "\n"
-		     "\t cache_policy     = 0x%02" PRIx8 "\n"
-		     "\t address          = 0x%016" PRIx64 "\n"
-		     "\t data_sel         = 0x%02" PRIx8 "\n"
-		     "\t data             = 0x%016" PRIx64 "\n"
-		     "\t gds_offset       = %" PRIu16 "\n"
-		     "\t gds_size         = %" PRIu16 "\n"
-		     "\t interrupt        = 0x%02" PRIx8 "\n"
-		     "\t interrupt_ctx_id = %" PRIu32 "\n",
-		     action, gcr_cntl, dst, cache_policy, reinterpret_cast<uint64_t>(address), data_sel,
-		     data, gds_offset, gds_size, interrupt, interrupt_ctx_id);
-	}
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(dst > 1);
@@ -3155,13 +3093,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t event_type = 0x%02" PRIx8 "\n"
-		     "\t address    = 0x%016" PRIx64 "\n",
-		     event_type, reinterpret_cast<uint64_t>(address));
-	}
-
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(event_type > 0x3fu);
 
@@ -3215,17 +3146,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles) {
 	PRINT_NAME();
-
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
-		LOGF("\t engine      = 0x%02" PRIx8 "\n"
-		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
-		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
-		     "\t base        = 0x%016" PRIx64 "\n"
-		     "\t size_bytes  = 0x%016" PRIx64 "\n"
-		     "\t poll_cycles = %" PRIu32 "\n",
-		     engine, cb_db_op, gcr_cntl, reinterpret_cast<uint64_t>(base), size_bytes, poll_cycles);
-	}
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 

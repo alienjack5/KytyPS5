@@ -232,6 +232,35 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.ps_helper_atomics_skip = !o.ps_helper_atomics_skip; });
   options_differ("loop_guard_all", [](CodegenOptions &o) { o.loop_guard_all = !o.loop_guard_all; });
   options_differ("volatile_loads", [](CodegenOptions &o) { o.volatile_loads = !o.volatile_loads; });
+  options_differ("buffers_by_address",
+                 [](CodegenOptions &o) { o.buffers_by_address = !o.buffers_by_address; });
+  {
+    // The uniform option is part of the identity only with buffers_by_address on: a cache written
+    // with it off and the uniform flag flipped stays valid (the flag changes nothing then).
+    auto options = GetCodegenOptions();
+    options.buffers_by_address = true;
+    options.buffers_by_address_uniform = false;
+    std::vector<uint8_t> by_address;
+    {
+      ScopedCodegenOptions scope(options);
+      by_address = ShaderRecompiler::CodegenFingerprint();
+    }
+    options.buffers_by_address_uniform = true;
+    {
+      ScopedCodegenOptions scope(options);
+      Require(name, "buffers_by_address_uniform", ShaderRecompiler::CodegenFingerprint() != by_address,
+              "the fingerprint does not depend on CodegenOptions::buffers_by_address_uniform with "
+              "buffers_by_address on");
+    }
+    options.buffers_by_address = false;
+    {
+      ScopedCodegenOptions scope(options);
+      Require(name, "buffers_by_address_uniform off",
+              ShaderRecompiler::CodegenFingerprint() == base,
+              "the fingerprint depends on CodegenOptions::buffers_by_address_uniform with "
+              "buffers_by_address off");
+    }
+  }
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;

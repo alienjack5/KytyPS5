@@ -107,6 +107,9 @@ CodegenOptions FromEnvironment() {
 	options.rt_type6     = EnvFlag("KYTY_RT_TYPE6", options.rt_type6);
 	options.bda_writes        = EnvFlag("KYTY_BDA_WRITES", options.bda_writes);
 	options.bda_store_log     = EnvFlag("KYTY_BDA_STORE_LOG", options.bda_store_log);
+	options.buffers_by_address = EnvFlag("KYTY_BUFFERS_BY_ADDRESS", options.buffers_by_address);
+	options.buffers_by_address_uniform =
+	    EnvFlag("KYTY_BUFFERS_BY_ADDRESS_UNIFORM", options.buffers_by_address_uniform);
 	if (const auto* budget = std::getenv("KYTY_RT_NODE_BUDGET");
 	    budget != nullptr && budget[0] != '\0') {
 		options.rt_node_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));

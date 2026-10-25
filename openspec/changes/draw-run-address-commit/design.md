@@ -128,7 +128,21 @@ option lets the GPU-time trade be measured). Everything else keeps its descripto
 classification is a function of the compiled program, so a program's descriptor set shape is fixed
 and a run (same program) never changes it.
 
-**The table**: per stage, one stream-ring upload per draw holding, in this order, the slot entries
+**The table — refinement found at task 1.2 (2026-10-25)**: the stage's *shader data* block already
+travels per draw by push constants when it fits the 128-byte range (`BindingLayout::UsesPushData`,
+cursor shared by the stages) and by a stream-ring upload with the `ShaderData` descriptor
+otherwise (`EmitShaderDataDwordLoad` reads either). The binding table is therefore not a new
+object: it is the shader data block extended with the slot entries (four dwords per addressable
+slot after the mip-statistics fields), delivered in the first of three ways that fits: (1) in push
+constants as today; (2) by a two-dword device-address pointer in push constants to the uploaded
+block (new: `BindingLayout::table_pointer_dword`, `EmitShaderDataDwordLoad` reads through a
+`PhysicalStorageBuffer` pointer), which keeps zero descriptor writes for the stage; (3) by the
+`ShaderData` descriptor as today (one write per stage per draw). Addressable slots have no
+`Buffers` or `UniformBuffers` element and their memory-offset byte stays zero. The paragraph
+below describes the same content as first drafted; the delivery order above supersedes its
+"one upload per draw with a pointer" wording.
+
+**The table (first draft)**: per stage, one stream-ring upload per draw holding, in this order, the slot entries
 (`uint64 device_address`, `uint32 size_bytes`, `uint32 flags`; a null slot has address 0 and size
 0) for every addressable slot, then the shader data the stage uploads today (user dwords, memory
 offsets of the descriptor-bound slots, mip-statistics fields), then the flattened SRT when the

@@ -142,6 +142,11 @@ std::vector<uint8_t> CodegenFingerprint() {
 		b.Text("lane_local");
 		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);
 	}
+	if (options.buffers_by_address) {
+		// The uniform option only changes a program compiled by address.
+		b.Text("buffers_by_address");
+		b.U8(options.buffers_by_address_uniform ? 1u : 0u);
+	}
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

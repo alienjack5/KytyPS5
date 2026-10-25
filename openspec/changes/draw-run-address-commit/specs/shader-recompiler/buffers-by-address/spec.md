@@ -52,8 +52,9 @@ dword-straddling accesses, stride and swizzle handling are those of the descript
 - **THEN** every case compares the by-address program's output with the descriptor program's output on the same inputs, including the last dword, a dword straddle, unaligned bytes, size 0, a size that is not a dword multiple and a null slot, and they are equal
 
 ### Requirement: The option is part of the cache key
-The shader and pipeline caches SHALL key a compiled program on the by-address option and the
-uniform option, so switching either never serves a program compiled under the other.
+The shader and pipeline caches SHALL key a compiled program on the by-address option and, while it
+is on, on the uniform option, so switching either never serves a program compiled under the other;
+with the by-address option off, the uniform option SHALL NOT change the key.
 
 #### Scenario: Switch flipped between boots
 - **WHEN** the emulator starts with a different value of `KYTY_BUFFERS_BY_ADDRESS` than the cache was written with

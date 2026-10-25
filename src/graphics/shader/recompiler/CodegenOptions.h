@@ -332,6 +332,18 @@ struct CodegenOptions {
 	// GPU-written count wrote nothing). Atomics there still drop (no value to return).
 	// KYTY_BDA_STORE_LOG=0 restores the drop.
 	bool bda_store_log = true;
+	// KYTY_BUFFERS_BY_ADDRESS=1 (OpenSpec change draw-run-address-commit, design D1; default off): a
+	// program's read-only, unformatted buffer slots are read through a per-draw binding table of
+	// device addresses, whose pointer is the stage's one per-draw push constant, instead of through
+	// descriptors; written, formatted, mip-statistics and indirect-parameter slots keep their
+	// descriptors (IR::BindingLayout). Part of the codegen fingerprint: a program cache written
+	// under the other value is not used.
+	bool buffers_by_address = false;
+	// KYTY_BUFFERS_BY_ADDRESS_UNIFORM=1: with buffers_by_address, the constant-only slots that
+	// KYTY_UNIFORM_BUFFERS binds as uniform buffers are addressable too; off (default), they keep
+	// their descriptor and the constant-cache path it gives them. Meaningless without
+	// buffers_by_address (not in the fingerprint then).
+	bool buffers_by_address_uniform = false;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the

@@ -194,6 +194,11 @@ uint32_t TypePhysicalU64Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU64(state));
 }
 
+uint32_t TypePhysicalElementPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+	                   TypeStorageBufferElement(state, bits));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPushConstant, TypeU32(state));
 }

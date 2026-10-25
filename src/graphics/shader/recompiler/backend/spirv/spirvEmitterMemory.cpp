@@ -270,7 +270,10 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		(void)ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		// An addressable slot (KYTY_BUFFERS_BY_ADDRESS) has no descriptor element to check for.
+		if (!IsAddressableBuffer(ctx.state, mem.resource)) {
+			(void)ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		}
 		// Shader-data byte offsets are per tracked buffer (memory_offset_count == buffers).
 		const auto prefix = ctx.state.memory_byte_offsets[mem.resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
@@ -314,7 +317,9 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 // GDS, scratch, formatted (all-or-nothing) accesses, stores and atomics keep their explicit checks.
 // KYTY_ROBUST_BUFFER_LOADS=0 keeps the explicit check everywhere.
 bool DeviceChecksDwordLoad(const MemoryResourceAccess& resource) {
-	return (resource.kind == IR::ResourceKind::Buffer ||
+	// A physical pointer (KYTY_BUFFERS_BY_ADDRESS) has no descriptor range to check against.
+	return !resource.by_address &&
+	       (resource.kind == IR::ResourceKind::Buffer ||
 	        resource.kind == IR::ResourceKind::ScalarBuffer) &&
 	       GetCodegenOptions().robust_buffer_loads &&
 	       GetHostBufferRobustness().storage_dword_loads_return_zero;
@@ -345,7 +350,8 @@ BranchlessLoad BranchlessLoadKind(EmitterState& state, const IR::MemoryInfo& mem
 		case IR::ResourceKind::Buffer:
 		case IR::ResourceKind::ScalarBuffer:
 			return GetCodegenOptions().robust_buffer_loads &&
-			               GetHostBufferRobustness().storage_dword_loads_return_zero
+			               GetHostBufferRobustness().storage_dword_loads_return_zero &&
+			               !IsAddressableBuffer(state, mem.resource)
 			           ? BranchlessLoad::Device
 			           : BranchlessLoad::None;
 		case IR::ResourceKind::Lds:
@@ -422,6 +428,12 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.by_address) {
+		// A physical pointer's load carries its alignment (KYTY_BUFFERS_BY_ADDRESS).
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
+		                              resource.memory_access, static_cast<uint32_t>(sizeof(uint32_t)));
+		return value;
+	}
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
 	return value;
@@ -432,9 +444,15 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	uint32_t value;
 	if (resource.element_bits < 32u) {
 		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad, TypeStorageBufferElement(ctx.state, bits), loaded,
-		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		if (resource.by_address) {
+			ctx.state.builder.AddFunction(spv::OpLoad, TypeStorageBufferElement(ctx.state, bits),
+			                              loaded, EmitMemoryElementPointer(ctx.state, resource, index),
+			                              resource.memory_access, resource.element_bits / 8u);
+		} else {
+			ctx.state.builder.AddFunction(spv::OpLoad, TypeStorageBufferElement(ctx.state, bits),
+			                              loaded, EmitMemoryElementPointer(ctx.state, resource, index),
+			                              resource.memory_access);
+		}
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -1994,16 +2012,20 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	// A physical pointer's load carries its alignment (KYTY_BUFFERS_BY_ADDRESS).
+	const auto Load = [&]() {
+		const auto pointer = EmitMemoryElementPointer(state, access, element);
+		return access.by_address
+		           ? EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer, access.memory_access,
+		                                                    static_cast<uint32_t>(sizeof(uint32_t)))
+		           : EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+	};
 	if (DeviceChecksDwordLoad(access)) {
-		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
-		                     state, EmitMemoryElementPointer(state, access, element)));
+		ctx.Define(inst, Load());
 		return;
 	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
-	           }));
+	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, Load));
 }
 
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {

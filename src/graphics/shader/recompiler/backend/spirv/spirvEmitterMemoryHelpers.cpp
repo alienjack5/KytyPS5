@@ -2,7 +2,55 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+namespace {
+
+// KYTY_BUFFERS_BY_ADDRESS (IR::BindingLayout::UsesTablePointer): the device address of the stage's
+// uploaded shader data, from the two push-constant dwords at table_pointer_dword.
+void EmitTablePointer(EmitterState& state) {
+	const auto& layout = state.program.bindings;
+	if (!layout.UsesTablePointer() || state.table_pointer != 0) {
+		return;
+	}
+	const auto LoadPush = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return Unary(state, spv::OpUConvert, TypeU64(state), value);
+	};
+	const auto low  = LoadPush(layout.table_pointer_dword);
+	const auto high = LoadPush(layout.table_pointer_dword + 1u);
+	state.table_pointer =
+	    Binary(state, spv::OpBitwiseOr, TypeU64(state),
+	           Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU64(state, 32)),
+	           low);
+}
+
+} // namespace
+
+bool IsAddressableBuffer(const EmitterState& state, uint32_t resource) {
+	return std::ranges::binary_search(state.program.bindings.address_buffers, resource);
+}
+
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
+	if (state.program.bindings.UsesTablePointer()) {
+		// KYTY_BUFFERS_BY_ADDRESS: the uploaded shader data through its pointer (EmitTablePointer
+		// ran at function entry).
+		if (state.table_pointer == 0) {
+			EXIT("shader data table pointer was not loaded before its first use\n");
+		}
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), state.table_pointer,
+		                            ConstantU64(state, uint64_t {dword_index} * sizeof(uint32_t)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
+		return value;
+	}
 	if (state.program.bindings.UsesPushData()) {
 		dword_index += state.program.bindings.push_data_start_dword;
 		const auto pointer = state.builder.AllocateId();
@@ -111,7 +159,26 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 	           ? 32u : info.component_bits[0];
 }
 
+// KYTY_BUFFERS_BY_ADDRESS: the address entries of the addressable slots, loaded once.
+void EmitAddressEntries(EmitterState& state) {
+	const auto& layout = state.program.bindings;
+	for (uint32_t k = 0; k < layout.address_buffers.size(); k++) {
+		const auto slot  = layout.address_buffers[k];
+		const auto dword = layout.AddressEntryDword(k);
+		const auto low   = Unary(state, spv::OpUConvert, TypeU64(state),
+		                         EmitShaderDataDwordLoad(state, dword));
+		const auto high  = Unary(state, spv::OpUConvert, TypeU64(state),
+		                         EmitShaderDataDwordLoad(state, dword + 1u));
+		state.address_buffer_base[slot] = Binary(
+		    state, spv::OpBitwiseOr, TypeU64(state),
+		    Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU64(state, 32)),
+		    low);
+		state.address_buffer_size[slot] = EmitShaderDataDwordLoad(state, dword + 2u);
+	}
+}
+
 void EmitMemoryOffsets(EmitterState& state) {
+	EmitTablePointer(state);
 	const auto count = state.program.bindings.memory_offset_count;
 	// One shader-data load per packed word of four byte offsets.
 	for (uint32_t i = 0; i < count; i += 4u) {
@@ -122,6 +189,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 		}
 	}
+	EmitAddressEntries(state);
 }
 
 // Stages without a workgroup emulate LDS with one private array per invocation. A GPU keeps
@@ -237,6 +305,25 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
 			                      ? StorageBufferElementBits(state.program, mem) : 32u;
+			if (IsAddressableBuffer(state, mem.resource)) {
+				// KYTY_BUFFERS_BY_ADDRESS: the slot's address entry instead of a descriptor. The
+				// length is the entry's size in elements (whole elements, as OpArrayLength gives).
+				if (state.address_buffer_base[mem.resource] == 0) {
+					EXIT("address entry of buffer slot %u was not loaded at function entry\n",
+					     static_cast<unsigned>(mem.resource));
+				}
+				access.by_address   = true;
+				access.base_address = state.address_buffer_base[mem.resource];
+				access.element_bits = bits;
+				access.byte_offset  = state.memory_byte_offsets[mem.resource];
+				access.memory_access = static_cast<spv::MemoryAccessMask>(
+				    spv::MemoryAccessAlignedMask |
+				    (mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone));
+				access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+				                       state.address_buffer_size[mem.resource],
+				                       ConstantU32(state, std::countr_zero(bits / 8u)));
+				return access;
+			}
 			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
 			                      : bits == 16u ? state.storage_buffer_u16_variable
 			                                    : state.storage_buffer_variable;
@@ -258,6 +345,20 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
+	if (access.by_address) {
+		// KYTY_BUFFERS_BY_ADDRESS: base + index * element bytes as a physical pointer.
+		const auto bytes =
+		    Binary(state, spv::OpIMul, TypeU64(state),
+		           Unary(state, spv::OpUConvert, TypeU64(state), index),
+		           ConstantU64(state, access.element_bits / 8u));
+		const auto address =
+		    Binary(state, spv::OpIAdd, TypeU64(state), access.base_address, bytes);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr,
+		                          TypePhysicalElementPointer(state, access.element_bits), pointer,
+		                          address);
+		return pointer;
+	}
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch
 		                               ? spv::StorageClassFunction : state.lds_storage_class;

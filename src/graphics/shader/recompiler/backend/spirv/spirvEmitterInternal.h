@@ -153,6 +153,14 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	// KYTY_BUFFERS_BY_ADDRESS (IR::BindingLayout::address_buffers): per slot, the device address
+	// (a u64 id) and the size in bytes (a u32 id) of its address entry, loaded once at function
+	// entry (EmitAddressEntries); 0 for a descriptor-bound slot.
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> address_buffer_base {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> address_buffer_size {};
+	// IR::BindingLayout::UsesTablePointer: the device address (u64 id) of the stage's uploaded
+	// shader data, loaded from the push constants at function entry (EmitTablePointer).
+	uint32_t                                         table_pointer           = 0;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -244,6 +252,8 @@ uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
 uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+// A PhysicalStorageBuffer pointer to a `bits`-wide unsigned element (KYTY_BUFFERS_BY_ADDRESS).
+uint32_t TypePhysicalElementPointer(EmitterState& state, uint32_t bits);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
 uint32_t TypePhysicalU64Pointer(EmitterState& state);
@@ -524,6 +534,8 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+// KYTY_BUFFERS_BY_ADDRESS: whether buffer slot `resource` is read through its address entry.
+[[nodiscard]] bool IsAddressableBuffer(const EmitterState& state, uint32_t resource);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
@@ -543,6 +555,12 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// KYTY_BUFFERS_BY_ADDRESS: the slot is read through its address entry: element pointers are
+	// PhysicalStorageBuffer pointers at base_address + index * element bytes, every load carries
+	// Aligned (memory_access) with the element size, and the device checks nothing
+	// (DeviceChecksDwordLoad is false), so the explicit in-bounds predicate always decides.
+	bool                  by_address       = false;
+	uint32_t              base_address     = 0;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,

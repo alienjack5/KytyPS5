@@ -25,6 +25,14 @@ SharedMemoryResources CollectSharedMemory(const Program& program);
 // dwords (HostBufferRobustness::uniform_dword_loads_return_zero). Ascending resource order.
 [[nodiscard]] std::vector<uint32_t> UniformBufferResources(const Program& program);
 
+// KYTY_BUFFERS_BY_ADDRESS (CodegenOptions::buffers_by_address): the buffer slots read through
+// per-draw address entries instead of a descriptor: slots the program only reads (no store or
+// atomic), never through a formatted access or a coherent (polling) load, with no image alias and
+// no indirect descriptor role; a slot of `uniform_buffers` (constant-only reads) only with
+// CodegenOptions::buffers_by_address_uniform. Ascending resource order; empty without the option.
+[[nodiscard]] std::vector<uint32_t> AddressableBufferResources(
+    const Program& program, const std::vector<uint32_t>& uniform_buffers);
+
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
 // Pixel shaders that sample images record, per GET_LOD_STATS counter, the finest mip level

@@ -558,21 +558,58 @@ struct BindingLayout {
 	// counter id, base level, no-counter flag, counting threshold), after the memory offsets.
 	// Non-zero only for shaders instrumented for mip statistics.
 	uint32_t                       mip_stats_count = 0;
+	// KYTY_BUFFERS_BY_ADDRESS (CodegenOptions::buffers_by_address, OpenSpec change
+	// draw-run-address-commit D1): the buffer slots read through per-draw address entries of the
+	// shader data instead of a descriptor element (ascending; empty without the option). Each
+	// entry takes AddressEntryDwords dwords after the mip-statistics fields: device address low and
+	// high, size in bytes, flags (0). Such a slot is in neither the Buffers nor the UniformBuffers
+	// group and its memory-offset byte stays zero.
+	std::vector<uint32_t>          address_buffers;
+	// With address entries, when the shader data does not fit the push range but two dwords do:
+	// the push-constant dwords holding the device address of the stage's uploaded shader data,
+	// which the shader reads through a physical pointer (no ShaderData descriptor). NoStart when
+	// the data is pushed or bound as the ShaderData descriptor.
+	uint32_t                       table_pointer_dword = PushData::NoStart;
+	static constexpr uint32_t      AddressEntryDwords  = 4;
+	static constexpr uint32_t      TablePointerDwords  = 2;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t MipStatsOffsetDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
+	// The first dword of the address entry of address_buffers[k].
+	[[nodiscard]] uint32_t AddressEntryDword(uint32_t k) const {
+		return MipStatsOffsetDword() + mip_stats_count + k * AddressEntryDwords;
+	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return MipStatsOffsetDword() + mip_stats_count;
+		return MipStatsOffsetDword() + mip_stats_count +
+		       static_cast<uint32_t>(address_buffers.size()) * AddressEntryDwords;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
+	[[nodiscard]] bool UsesTablePointer() const {
+		return table_pointer_dword != PushData::NoStart;
+	}
+	// Whether this layout is the one AllocateBindings builds for a stage placed at `cursor` of the
+	// shared push range: pushed data at StartFor(cursor, dwords), else (with address entries) the
+	// table pointer at StartFor(cursor, TablePointerDwords), else neither.
+	[[nodiscard]] bool PlacedAt(uint32_t cursor) const {
+		const auto start = PushData::StartFor(cursor, ShaderDataDwords());
+		if (push_data_start_dword != start) {
+			return false;
+		}
+		const auto pointer = start == PushData::NoStart && !address_buffers.empty()
+		                         ? PushData::StartFor(cursor, TablePointerDwords)
+		                         : PushData::NoStart;
+		return table_pointer_dword == pointer;
+	}
 	void AdvancePushData(uint32_t& cursor) const {
 		if (UsesPushData()) {
 			cursor = push_data_start_dword + ShaderDataDwords();
+		} else if (UsesTablePointer()) {
+			cursor = table_pointer_dword + TablePointerDwords;
 		}
 	}
 

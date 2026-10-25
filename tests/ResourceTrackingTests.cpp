@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <array>
 #include <bit>
@@ -3113,6 +3114,146 @@ void TestGraphicsPushConstantLayout() {
         "storage fallback retained an irrelevant attempted push-data position");
 }
 
+// KYTY_BUFFERS_BY_ADDRESS (CodegenOptions::buffers_by_address, OpenSpec change
+// draw-run-address-commit): which slots the binding layout reads by address, and how the shader
+// data block with their entries is delivered: pushed, through the table pointer, or as the
+// ShaderData descriptor.
+void TestAddressableBufferSlots() {
+  namespace Recompiler = Libs::Graphics::ShaderRecompiler;
+  struct Restore {
+    Recompiler::CodegenOptions options = Recompiler::GetCodegenOptions();
+    bool robust = Recompiler::GetHostUniformBufferRobust();
+    ~Restore() {
+      Recompiler::SetCodegenOptions(options);
+      Recompiler::SetHostUniformBufferRobust(robust);
+    }
+  } restore;
+  // Slot 0: a raw read; slot 1: a store; slot 2: a formatted read; slot 3: constant-only reads
+  // (a uniform view with KYTY_UNIFORM_BUFFERS).
+  const auto Build = [](Fixture &fixture) {
+    const auto raw = fixture.Buffer(
+        {fixture.UserData(0), fixture.UserData(1), Value(256u), Value(0u)}, 4);
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {raw, Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(load, 4));
+    const auto written = fixture.Buffer(
+        {fixture.UserData(2), fixture.UserData(3), Value(256u), Value(0u)}, 8);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {written, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                 fixture.AddMemory(store, 8));
+    const auto formatted = fixture.Buffer(
+        {fixture.UserData(4), fixture.UserData(5), Value(256u), Value(0u)}, 12);
+    MemoryInfo typed;
+    typed.kind = ResourceKind::Buffer;
+    typed.formatted = true;
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {formatted, Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(typed, 12));
+    const auto constants = fixture.Buffer(
+        {fixture.UserData(6), fixture.UserData(7), Value(256u), Value(0u)}, 16);
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    fixture.Emit(ValueOpcode::ReadConstBuffer, {constants, Value(16u)},
+                 fixture.AddMemory(scalar, 16));
+    fixture.PlanAndTrack();
+    ShaderComputeInputInfo compute{};
+    CollectShaderInfo(fixture.program, {.compute = &compute});
+    Check(fixture.program.info.buffers.size() == 4 &&
+              !fixture.program.info.buffers[0].written &&
+              fixture.program.info.buffers[1].written &&
+              fixture.program.info.buffers[2].formatted,
+          "the four test slots were not tracked as intended");
+  };
+  const auto Resources = [](const Program &program, DescriptorBindingKind kind) {
+    const auto *binding = FindBinding(program.bindings, kind);
+    return binding != nullptr ? binding->resources : std::vector<uint32_t>{};
+  };
+  auto options = Recompiler::GetCodegenOptions();
+  options.uniform_buffers = true;
+  options.buffers_by_address = false;
+  options.buffers_by_address_uniform = false;
+  Recompiler::SetHostUniformBufferRobust(true);
+
+  // Option off: nothing is addressable and the layout is the uniform-buffers one.
+  Recompiler::SetCodegenOptions(options);
+  Fixture off;
+  Build(off);
+  AllocateBindings(off.program);
+  Check(off.program.bindings.address_buffers.empty() &&
+            Resources(off.program, DescriptorBindingKind::Buffers) ==
+                std::vector<uint32_t>({0u, 1u, 2u}) &&
+            Resources(off.program, DescriptorBindingKind::UniformBuffers) ==
+                std::vector<uint32_t>({3u}) &&
+            !off.program.bindings.UsesTablePointer() &&
+            off.program.bindings.ShaderDataDwords() == 8u + 1u,
+        "with KYTY_BUFFERS_BY_ADDRESS off the layout changed");
+
+  // Option on: the raw read-only slot is addressable; the written, formatted and uniform-view
+  // slots keep their descriptors; one address entry extends the pushed shader data.
+  options.buffers_by_address = true;
+  Recompiler::SetCodegenOptions(options);
+  Fixture on;
+  Build(on);
+  AllocateBindings(on.program);
+  Check(on.program.bindings.address_buffers == std::vector<uint32_t>({0u}) &&
+            Resources(on.program, DescriptorBindingKind::Buffers) ==
+                std::vector<uint32_t>({1u, 2u}) &&
+            Resources(on.program, DescriptorBindingKind::UniformBuffers) ==
+                std::vector<uint32_t>({3u}) &&
+            on.program.bindings.UsesPushData() && !on.program.bindings.UsesTablePointer() &&
+            FindBinding(on.program.bindings, DescriptorBindingKind::ShaderData) == nullptr &&
+            on.program.bindings.ShaderDataDwords() == 8u + 1u + BindingLayout::AddressEntryDwords &&
+            on.program.bindings.AddressEntryDword(0) == 8u + 1u,
+        "KYTY_BUFFERS_BY_ADDRESS did not classify the slots as specified");
+
+  // The uniform option: the constant-only slot is addressable too, and no uniform group remains.
+  options.buffers_by_address_uniform = true;
+  Recompiler::SetCodegenOptions(options);
+  Fixture uniform;
+  Build(uniform);
+  AllocateBindings(uniform.program);
+  Check(uniform.program.bindings.address_buffers == std::vector<uint32_t>({0u, 3u}) &&
+            Resources(uniform.program, DescriptorBindingKind::Buffers) ==
+                std::vector<uint32_t>({1u, 2u}) &&
+            FindBinding(uniform.program.bindings, DescriptorBindingKind::UniformBuffers) ==
+                nullptr &&
+            uniform.program.bindings.ShaderDataDwords() ==
+                8u + 1u + 2u * BindingLayout::AddressEntryDwords,
+        "KYTY_BUFFERS_BY_ADDRESS_UNIFORM did not move the uniform-view slot");
+
+  // Delivery: 17 dwords do not fit after a cursor of 20, two do: the table pointer takes dwords
+  // 20-21 and no ShaderData descriptor exists; the cursor advances past the pointer.
+  Fixture pointer;
+  Build(pointer);
+  uint32_t cursor = 20;
+  AllocateBindings(pointer.program, cursor);
+  Check(!pointer.program.bindings.UsesPushData() && pointer.program.bindings.UsesTablePointer() &&
+            pointer.program.bindings.table_pointer_dword == 20u &&
+            FindBinding(pointer.program.bindings, DescriptorBindingKind::ShaderData) == nullptr &&
+            pointer.program.bindings.PlacedAt(20u) && !pointer.program.bindings.PlacedAt(0u),
+        "the table pointer did not take the push dwords the data could not");
+  pointer.program.bindings.AdvancePushData(cursor);
+  Check(cursor == 22u, "the table pointer did not advance the shared push-data cursor");
+
+  // Neither the data nor the pointer fits at 31: the block is the ShaderData descriptor, the slots
+  // stay addressable and the cursor does not move.
+  Fixture spill;
+  Build(spill);
+  cursor = 31;
+  AllocateBindings(spill.program, cursor);
+  Check(!spill.program.bindings.UsesPushData() && !spill.program.bindings.UsesTablePointer() &&
+            spill.program.bindings.address_buffers == std::vector<uint32_t>({0u, 3u}) &&
+            FindBinding(spill.program.bindings, DescriptorBindingKind::ShaderData) != nullptr &&
+            spill.program.bindings.PlacedAt(31u),
+        "a block that fits nowhere did not fall back to the ShaderData descriptor");
+  spill.program.bindings.AdvancePushData(cursor);
+  Check(cursor == 31u, "a spilled stage consumed shared push-data space");
+}
+
 void TestResourceLimitIsTransactional() {
   Fixture accepted;
   MemoryInfo accepted_memory;
@@ -3384,6 +3525,7 @@ int main() {
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
+    Run("addressable buffer slots", TestAddressableBufferSlots);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("buffer write ranges", TestBufferWriteRanges);

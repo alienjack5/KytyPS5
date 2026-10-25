@@ -340,9 +340,9 @@ Accept for the preset when:
 - [Shader cache invalidation] → one rebuild on the first boot with the option, as with every key
   change; the first minutes of a run are excluded from measurement as today.
 - [Push-constant range exhausted on programs with mesh dwords and clip planes and three stages with
-  tables] → `BindingLayout::StartFor` refuses the table pointer when it does not fit and the stage
-  stays on descriptors (counted: `addr-slots 0` for that program); measured per program in the
-  suite.
+  tables] → the stage falls back to the `ShaderData` descriptor for its block (one write per stage
+  per draw, as today) while its slots stay addressable; the suite's layout test covers the three
+  placements, and the `desc-writes-saved` item shows how often the fallback happens in-game.
 - [Gain smaller than modelled] → the steps line attributes each µs; D1/D2 and D3 are independent
   switches, each kept or dropped on its own number.
 

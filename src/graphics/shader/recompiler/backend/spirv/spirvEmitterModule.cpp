@@ -35,8 +35,12 @@ void NoteMissingComputeDerivatives(uint64_t shader_hash) {
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
 	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params).
+	// KYTY_BUFFERS_BY_ADDRESS: buffer slots read through device addresses, or the shader data
+	// reached through its table pointer.
 	return state.program.info.uses_dma ||
-	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params);
+	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params) ||
+	       !state.program.bindings.address_buffers.empty() ||
+	       state.program.bindings.UsesTablePointer();
 }
 
 uint32_t TypeVoid(EmitterState& state) {
@@ -252,8 +256,8 @@ void DefineDescriptors(EmitterState& state) {
 	                              state.program.stage != ShaderType::Compute &&
 	                              state.input_info.vertex != nullptr &&
 	                              state.input_info.vertex->user_clip_planes != 0;
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    user_clip_planes) {
+	if (state.program.bindings.UsesPushData() || state.program.bindings.UsesTablePointer() ||
+	    state.program.stage == ShaderType::Mesh || user_clip_planes) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);

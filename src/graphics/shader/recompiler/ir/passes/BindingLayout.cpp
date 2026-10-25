@@ -137,6 +137,55 @@ std::vector<uint32_t> UniformBufferResources(const Program& program) {
 	return result;
 }
 
+std::vector<uint32_t> AddressableBufferResources(const Program&               program,
+                                                 const std::vector<uint32_t>& uniform_buffers) {
+	std::vector<uint32_t> result;
+	const auto&           options = GetCodegenOptions();
+	if (!options.buffers_by_address || program.info.buffers.empty()) {
+		return result;
+	}
+	const auto& buffers = program.info.buffers;
+	// A coherent (DLC/GLC polling) load keeps its descriptor: the descriptor variable carries the
+	// Coherent decoration that makes every alias of the buffer participate in visibility.
+	std::vector<bool> coherent(buffers.size(), false);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				return {};
+			}
+			const auto& memory = program.memory_info[index];
+			if (memory.planning_only ||
+			    (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::ScalarBuffer)) {
+				continue;
+			}
+			if (memory.resource >= coherent.size()) {
+				return {};
+			}
+			if (memory.coherent) {
+				coherent[memory.resource] = true;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < buffers.size(); i++) {
+		const auto& buffer = buffers[i];
+		if (!buffer.read || buffer.written || buffer.atomic || buffer.formatted || coherent[i] ||
+		    buffer.image_alias != BufferResource::NoImageAlias ||
+		    buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+		    !buffer.indirect_resources.empty()) {
+			continue;
+		}
+		if (!options.buffers_by_address_uniform && std::ranges::binary_search(uniform_buffers, i)) {
+			continue;
+		}
+		result.push_back(i);
+	}
+	return result;
+}
+
 bool UsesBvhNodeCount(const Program& program) {
 	const auto& options = GetCodegenOptions();
 	if (options.rt_node_budget == 0 && !options.rt_node_stats) {
@@ -181,14 +230,27 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
 	const bool mip_stats     = UsesMipStats(program);
 	next.mip_stats_count     = mip_stats ? static_cast<uint32_t>(program.info.images.size()) : 0u;
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	auto uniform_buffers = UniformBufferResources(program);
+	// KYTY_BUFFERS_BY_ADDRESS: an addressable slot leaves both descriptor groups; its address entry
+	// extends the shader data (ShaderDataDwords), which is pushed when it fits, else reached through
+	// the table pointer when two dwords fit, else bound as the ShaderData descriptor.
+	const auto address_buffers = AddressableBufferResources(program, uniform_buffers);
+	std::erase_if(uniform_buffers, [&](uint32_t i) {
+		return std::ranges::binary_search(address_buffers, i);
+	});
+	next.address_buffers       = address_buffers;
+	next.push_data_start_dword =
+	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	if (!next.UsesPushData() && !address_buffers.empty()) {
+		next.table_pointer_dword =
+		    PushData::StartFor(push_data_start_dword, BindingLayout::TablePointerDwords);
+	}
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources;
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			if (!std::ranges::binary_search(uniform_buffers, i)) {
+			if (!std::ranges::binary_search(uniform_buffers, i) &&
+			    !std::ranges::binary_search(address_buffers, i)) {
 				resources.push_back(i);
 			}
 		}
@@ -254,7 +316,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
-	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
+	if (next.ShaderDataDwords() != 0 && !next.UsesPushData() && !next.UsesTablePointer()) {
 		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 	if (mip_stats) {

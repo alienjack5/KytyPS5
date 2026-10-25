@@ -63,10 +63,15 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		expected[index]  = std::move(resources);
 	};
 	{
-		auto uniform = IR::UniformBufferResources(program);
+		auto       uniform = IR::UniformBufferResources(program);
+		const auto address = IR::AddressableBufferResources(program, uniform);
+		std::erase_if(uniform, [&](uint32_t i) { return std::ranges::binary_search(address, i); });
+		if (address != program.bindings.address_buffers) {
+			Fail(program, "native shader plan's addressable buffers do not match shader topology");
+		}
 		std::vector<uint32_t> storage;
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			if (!std::ranges::binary_search(uniform, i)) {
+			if (!std::ranges::binary_search(uniform, i) && !std::ranges::binary_search(address, i)) {
 				storage.push_back(i);
 			}
 		}
@@ -114,7 +119,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
-	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
+	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData() &&
+	    !program.bindings.UsesTablePointer()) {
 		Expect(Kind::ShaderData);
 	}
 	const bool mip_stats = IR::UsesMipStats(program);
@@ -147,7 +153,12 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
 	    program.bindings.mip_stats_count != (mip_stats ? program.info.images.size() : 0u) ||
-	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
+	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData() &&
+	                                !program.bindings.UsesTablePointer()) ||
+	    (program.bindings.UsesTablePointer() &&
+	     (program.bindings.UsesPushData() || program.bindings.address_buffers.empty() ||
+	      !IR::PushData::CanFit(program.bindings.table_pointer_dword,
+	                            IR::BindingLayout::TablePointerDwords))) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
 	    std::adjacent_find(program.bindings.user_data_registers.begin(),

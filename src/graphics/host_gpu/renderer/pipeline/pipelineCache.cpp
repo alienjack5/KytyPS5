@@ -2137,10 +2137,8 @@ struct PipelineCache::ProgramCache {
 	static bool PermutationMatches(const Permutation& candidate,
 	                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                               uint32_t push_data_cursor) {
-		const auto& layout = candidate.program.bindings;
-		return layout.push_data_start_dword ==
-		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-		                                                    layout.ShaderDataDwords()) &&
+		// Pushed data or the table pointer (KYTY_BUFFERS_BY_ADDRESS) at this cursor's position.
+		return candidate.program.bindings.PlacedAt(push_data_cursor) &&
 		       candidate.specialization == specialization;
 	}
 
@@ -3472,10 +3470,7 @@ struct PipelineCache::ProgramCache {
 			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
 			    source->reuse.current.prepared_reads.Valid()) {
 				const auto* cached = PermutationAt(*source, source->reuse.current.permutation_index);
-				if (cached != nullptr &&
-				    cached->program.bindings.push_data_start_dword ==
-				        ShaderRecompiler::IR::PushData::StartFor(
-				            push_data_cursor, cached->program.bindings.ShaderDataDwords())) {
+				if (cached != nullptr && cached->program.bindings.PlacedAt(push_data_cursor)) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCachePermutationHits);
 					return Bind(*cached, input_info, prep, push_data_cursor);
 				}

@@ -23,19 +23,27 @@ the program alone, so a program's descriptor set shape is fixed across draws.
 - **WHEN** `KYTY_BUFFERS_BY_ADDRESS` is unset, empty, `0` or `off`
 - **THEN** the program compiles and binds exactly as before this capability, with the same cache key as before
 
-### Requirement: The binding table is the program's per-draw input
-A stage with addressable slots SHALL read its per-draw buffer data from a binding table at a device
-address delivered in its push constants, and SHALL have no `ShaderData` or `FlattenedSrt`
-descriptor; a program whose push constants cannot hold the table pointer SHALL compile without
-addressable slots.
+### Requirement: The address entries are part of the stage's shader data
+A stage with addressable slots SHALL carry one address entry per addressable slot after the
+mip-statistics fields of its per-draw shader data, and SHALL deliver that shader data in the first
+of three placements that fits the shared push-constant range: pushed, through a two-dword pointer,
+or as the `ShaderData` descriptor.
 
-#### Scenario: Table layout
-- **WHEN** a stage has addressable slots
-- **THEN** its table holds one entry per addressable slot (device address and size in bytes; a null slot has address 0 and size 0), then the stage's shader data, then its flattened SRT when the program has one, and the table pointer's dwords follow the mesh and clip-plane dwords in the push constants
+#### Scenario: Entry layout
+- **WHEN** a slot is addressable
+- **THEN** its entry holds the device address low and high dwords, the size in bytes and a flags dword, and a null slot has address 0 and size 0
 
-#### Scenario: Table pointer does not fit
-- **WHEN** a program's push constants have no room for the table pointer after its mesh and clip-plane dwords
-- **THEN** every slot of that program stays descriptor-bound and the program is counted as such
+#### Scenario: Data fits the push range
+- **WHEN** a stage's shader data with its address entries fits the remaining push-constant dwords
+- **THEN** the entries are pushed with the rest of the shader data and the stage has no `ShaderData` descriptor
+
+#### Scenario: Only the pointer fits
+- **WHEN** the shader data does not fit the remaining push-constant dwords but two dwords do
+- **THEN** the stage's uploaded shader data is reached through the pointer in those two dwords, the stage has no `ShaderData` descriptor, and the pushed cursor advances past the pointer
+
+#### Scenario: Nothing fits
+- **WHEN** neither the shader data nor two dwords fit the remaining push-constant dwords
+- **THEN** the stage binds its shader data as the `ShaderData` descriptor, its slots stay addressable, and the pushed cursor does not move
 
 ### Requirement: Address reads equal descriptor reads
 A read of an addressable slot SHALL return the same value the descriptor-bound read of the same

@@ -12318,3 +12318,17 @@ M	tests/VirtualMemoryAllocationTests.cpp
 M	tests/shaderCfgTests.cpp
 A	tools/hangtrace/analyze_gpuops.py
 ```
+
+## alienjack5 fork (Linux) additions
+
+Commits of the `alien` branch beyond the Jetsku U59 line, in the order they were made. Hashes link to
+the fork repository. Measured results are in [CHANGES-U59.md](CHANGES-U59.md) and the OpenSpec
+archive under `openspec/changes/archive/`.
+
+### 1. Draw runs: a continuation reuses the recorded draw's buffer resolutions (KYTY_DRAW_RUN_BINDINGS)
+
+Commit: [`8ecc2457`](https://github.com/alienjack5/KytyPS5/commit/8ecc24571ba6c7fcc54161e33ab324ac7d5b0f52) · **Command processor draw path** · OpenSpec change `draw-run-continuation-fast-path`
+
+A draw that continues a run (`KYTY_DRAW_RUN=1`) resolved every read V#, vertex range and index buffer through the buffer cache again. The run record now keeps each recorded draw's resolutions, and with `KYTY_DRAW_RUN_BINDINGS=1` (live switch, default off, `verify`/`exit` modes; on in the measuring preset) a continuation whose range for a slot is exactly the recorded one binds the recorded buffer and offset while the cache's structure epoch is unchanged. Only the exact range is reused: the sub-range hint and the `FindBuffer` skip were measured and removed (`FindBuffer` is not deterministic between overlapping cache buffers). Measured in ASTRO's PLAYROOM (Linux, i7-11800H + RTX 3070 Laptop): continuation commit 5.30 → 4.65 µs, gap 0.71 → 0.52 µs (−14% per draw), fps p50 16.4 → 17.0; the 3.0 µs target was not reached (remaining cost: per-draw data movement, descriptors, push constants, the draw). God of War Sons of Sparta unchanged at 60 fps with 0 verify mismatches. Also `KYTY_KEEP_SYMBOLS` (CMake) and the ctest variants `draw_run_bindings`, `draw_run_bindings_verify`, `draw_prep_engine_parallel_run_bindings`.
+
+Changed files: `CMakeLists.txt`, `docs/CHANGES-U59.md`, `src/graphics/host_gpu/renderer/cache/bufferCache.h`, `src/graphics/host_gpu/renderer/drawPrep/commitStats.cpp`, `src/graphics/host_gpu/renderer/drawPrep/commitStats.h`, `src/graphics/host_gpu/renderer/drawPrep/drawRun.cpp`, `src/graphics/host_gpu/renderer/drawPrep/drawRun.h`, `src/graphics/host_gpu/renderer/pipeline/descriptors.cpp`, `src/graphics/host_gpu/renderer/pipeline/descriptors.h`, `src/graphics/host_gpu/renderer/render.h`, `src/graphics/host_gpu/renderer/renderDraw.cpp`, `tests/ShaderRecompilerComputeTests.cpp`, `openspec/changes/archive/2026-10-25-draw-run-continuation-fast-path/`.

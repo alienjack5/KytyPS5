@@ -119,6 +119,9 @@ void NoteProtect(bool unprotect, uint64_t pages, uint64_t ns) noexcept;
 // BDA synchronization passes (BufferCache::SynchronizeBdaBuffersNow) and their upload bytes:
 // 0 nothing to do, 1 hot runs only, 2 dirty-log pass, 3 full scan.
 void NoteBdaPass(int kind, uint64_t bytes) noexcept;
+// One BufferCache::SynchronizeBdaBuffers call: skipped by the epoch or submission gate, or a pass
+// that took pass_ns (the line reports calls, skips and ms per frame: KYTY_BDA_SYNC_ALL_DRAWS gate).
+void NoteBdaCall(bool skipped, uint64_t pass_ns) noexcept;
 
 // One more line for the periodic live log (other modules' counters; the loader's VRSQRTPS traps).
 using PeriodicReporter = void (*)(double seconds, uint64_t frames);

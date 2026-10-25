@@ -180,6 +180,11 @@ int64_t ParseBdaSyncPerSubmission(const char* value) {
 	return std::strcmp(value, "verify") == 0 ? 2 : 1;
 }
 Live::Switch g_bda_sync_per_submission("KYTY_BDA_SYNC_PER_SUBMISSION", ParseBdaSyncPerSubmission);
+// KYTY_BDA_SYNC_ALL_DRAWS=1 (diagnostic, default off, live): every graphics draw runs
+// SynchronizeBdaBuffers before its bindings, as a draw with address-read buffers would (OpenSpec
+// change draw-run-address-commit, D0): the "Kyty BDA passes" line then shows what the epoch pass
+// costs per frame when it carries every draw's synchronization.
+Live::Switch g_bda_sync_all_draws("KYTY_BDA_SYNC_ALL_DRAWS", Live::ParseDefaultOff);
 
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
@@ -5247,6 +5252,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
 	if (m_bda_epoch_skip && sync_epoch == m_bda_synced_epoch &&
 	    structure == m_bda_synced_structure) {
+		FaultCost::NoteBdaCall(true, 0);
 		BufferLookupStats::AddPart(BufferLookupStats::Part::BdaSkip, 0);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
 		m_bda_epoch_totals.skips++;
@@ -5267,6 +5273,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const bool same_submission = per_submission != 0 && submission == m_bda_synced_submission &&
 	                             structure == m_bda_synced_structure;
 	if (same_submission && per_submission == 1) {
+		FaultCost::NoteBdaCall(true, 0);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSubmissionSkips);
 		m_bda_epoch_totals.submission_skips++;
 		ReportBdaSubmissionGate();
@@ -5276,7 +5283,9 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
 	const auto pass_start      = BufferLookupStats::Now();
+	const auto pass_begin_ns   = FaultCost::NowNs();
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	FaultCost::NoteBdaCall(false, FaultCost::NowNs() - pass_begin_ns);
 	if (pass_start != 0) {
 		BufferLookupStats::AddPart(static_cast<BufferLookupStats::Part>(m_bda_pass_kind),
 		                           BufferLookupStats::Now() - pass_start);
@@ -5653,6 +5662,10 @@ bool BdaWritesEnabled() {
 
 bool BdaWritesVerify() {
 	return GetBdaWritesMode() == BdaWritesMode::Verify;
+}
+
+bool BdaSyncAllDraws() {
+	return g_bda_sync_all_draws.On();
 }
 
 void BufferCache::PrepareBdaWrites() {

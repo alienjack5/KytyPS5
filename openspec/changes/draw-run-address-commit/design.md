@@ -97,6 +97,20 @@ synchronization). If they cost more, D1 goes *variant B*: the lean lookup keeps 
 and `ObtainBufferNow` for misses (today's synchronization), and only the descriptor side changes;
 the acceptance target moves to ≤ 3.0 µs. The switch stays as a diagnostic either way.
 
+**Measured 2026-10-25 (`_console-20261025-195210.txt`, 3.4 min, same area): variant A is rejected.**
+With the pass under every draw: 5 200–8 100 calls per frame, 98.5% skipped by the epoch gate, but
+still **80 passes per frame** (55–66 hot-page passes, 22–24 dirty-log passes uploading 29–33 MB per
+frame, against 2–4 passes and 8–12 MB without the switch): **3.5–3.6 ms per frame inside the
+passes**, the epoch advancing about 80 times per frame (command-buffer and wait boundaries). The
+passes land on the instance starts (`instance` class `bda` step 0.8 → 11.1 µs, 18.9 → 31.8 µs per
+boundary) and the resolver went from 41.3 to 46.2 ms per frame (continuation 4.62 → 5.19 µs from
+the extra upload traffic), fps p50 in the heavy windows 18.1 → 16. The pass would cost more than
+the ≈ 3 ms of per-binding synchronization it replaces, and it uploads four times the bytes (whole
+dirtied ranges, not the ranges the draws read). **D1 and D2 go variant B**: the binding memo and
+`ObtainBufferNow` keep synchronizing each range; what changes is how the result is delivered (the
+table, no descriptors) and how a continuation re-finds a buffer it already resolved (the owner
+check). `PrepareBda` stays where it is (programs with computed V#s). Acceptance: ≤ 3.0 µs.
+
 *Why first*: it is a 20-line change and one gameplay run, and it decides the shape of everything
 below. *Expected*: the epoch advances at ordering points (per command buffer, wait, flush), of
 which this title has a few hundred per frame; most passes find an unchanged epoch or an empty
@@ -179,8 +193,8 @@ For an addressable V# range, a vertex range or an index buffer, the resolver:
    create or join buffers (the structure epoch then moves and the next epoch pass covers the new
    buffer's pages, which start CPU-dirty).
 
-Current data (variant A, D0 permitting): `PrepareGraphicsBindings` calls `PrepareBda` before a
-draw with addressable slots, so every registered buffer's CPU-dirty bytes within the mapped ranges
+Current data — variant A, **rejected by D0** (kept here as the measured alternative):
+`PrepareGraphicsBindings` would call `PrepareBda` before a draw with addressable slots, so every registered buffer's CPU-dirty bytes within the mapped ranges
 are uploaded once per synchronization epoch, before the draws of that epoch are recorded — the same
 guarantee `KYTY_SRT_VARIANT_READS` relies on for computed V#s, now for bound ones. The lean lookup
 does no per-binding upload. A GPU-written owner (`IsGpuModified`, pending write ownership) keeps the
@@ -190,10 +204,13 @@ needs the owner's handle and offset, not a device address, and the bind is encod
 owner or offset changed since the previous draw of the run (the archived change found identical
 binds cost 0.01 µs to re-encode; the saving here is the resolution, not the bind).
 
-Variant B (if D0 fails): steps 1–3 as above for the *identity* of the buffer, but the
-synchronization of a range not reused from the record goes through `ObtainReadBinding`'s memo and
-`ObtainBufferNow` as today; D1's descriptor side is unchanged. Expected: the descriptor and
-vertex/index gains only (about 0.9 µs).
+**Variant B (chosen)**: steps 1–3 as above for the *identity* of the buffer (a continuation whose
+range lies inside the recorded owner skips the lookup and the memo), but a range not served from
+the record goes through `ObtainReadBinding`'s memo and `ObtainBufferNow` as today, so CPU-dirty
+bytes are copied per binding as now; D1's descriptor side is unchanged. Expected from the step
+table: descriptors and push 0.52 → ≈ 0.15, `rbbindings` 0.66 → ≈ 0.5 (no `StorageDescriptor`
+build, record-owner hits for ring advances), vertex/index ≈ unchanged; with D3 the control, post
+and gap groups 2.2 → ≈ 1.1: a continuation of about 3.0 µs.
 
 *Why the owner is sound where `FindBuffer` was not*: the dropped hint path reused *a* buffer that
 covered the range while another registered buffer could cover it too and hold the GPU-written
@@ -277,8 +294,11 @@ Accept for the preset when:
   follow-up of the archived change) or excluded from this gate by counting its part separately;
 - God of War Sons of Sparta stays at 60 fps with every switch on, 0 verify mismatches;
 - the full ctest suite passes with the new variants, including the by-address shader selector;
-- the same run without `KYTY_CP_COMMIT_STATS` (fps and CP busy from the hang trace only) confirms
-  the fps gain, so the instrumentation's own cost is not part of the claim.
+- the fps and resolver claims are made on runs **without** `KYTY_CP_COMMIT_STATS` (hang trace:
+  fps, CP busy; `DrawRun 10s` draws per window), because task 0.3 measured the `steps`
+  instrumentation at about a quarter of the frame time per draw (26.4 vs 18.2 fps at equal draw
+  counts, 2026-10-25); the `steps` runs give the per-step attribution only, compared stats-on against
+  stats-on. The fast lane marks fewer steps, so a stats-on comparison would overstate its gain.
 
 ## Risks / Trade-offs
 

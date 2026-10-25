@@ -53,10 +53,12 @@ conditions. This change puts them together for the common case.
   buffer by the host page-table owner lookup plus a structure-epoch check (`FindBuffer` without the
   binding memo, the memory-tracker signature or per-binding synchronization), and to a device
   address or bind offset from the owner's base. A range without a covering owner takes today's
-  `ObtainBuffer` (which may create or join buffers). CPU-dirty bytes become current for the GPU
-  through the existing epoch synchronization pass (`PrepareBda`), which this change runs before any
-  draw with addressable slots rather than only before programs with computed V#s; GPU-written
-  buffers keep the read-after-write barrier decision of `ObtainBuffer`.
+  `ObtainBuffer` (which may create or join buffers). A range not served from the run record keeps
+  today's per-binding synchronization (binding memo, stream copy of CPU-dirty bytes): the
+  alternative — current data through the epoch synchronization pass (`PrepareBda`) under every
+  draw — was measured first (design D0, 2026-10-25) and rejected: 80 passes and 3.5 ms per frame,
+  four times the upload bytes. GPU-written buffers keep the read-after-write barrier decision of
+  `ObtainBuffer`.
 - **A continuation fast lane** (`KYTY_DRAW_RUN_FAST`, default off): a draw that continues a run is
   committed by a dedicated path that does only what can differ per draw: late check (command
   identity, image state, activity epoch), certificate, resolution of addressable ranges, the table
@@ -65,11 +67,12 @@ conditions. This change puts them together for the common case.
   certificate, target ops, draw checks, pipeline selection, acquisition and barrier classification,
   dynamic state, rendering begin, descriptor pushes) is not re-derived. `KYTY_DRAW_RUN=verify`
   gains compares for the items the lane skips that it did not compare before.
-- **Measurement gate first** (design D0): before the shader work, one diagnostic switch makes every
-  draw trigger the epoch synchronization pass as the addressable path would, and the `Kyty BDA
-  passes` line tells how many passes a frame runs and what they cost. If the pass costs more per
-  frame than the per-binding synchronization it replaces, D1 falls back to a host-synchronized
-  variant (memo kept, descriptors still gone) and the acceptance numbers are revised.
+- **Measurement gate first** (design D0, done 2026-10-25): the diagnostic switch
+  `KYTY_BDA_SYNC_ALL_DRAWS` made every draw trigger the epoch synchronization pass, and the `Kyty
+  BDA passes` line (now with calls, gate skips and ms per frame) showed 80 passes and 3.5 ms per
+  frame: more than the per-binding synchronization it would replace. The change therefore keeps
+  per-binding synchronization (variant B) and takes the descriptor, identity and fast-lane gains;
+  the acceptance target is 3.0 µs per continuation.
 - **Diagnostics**: `StartPhases`/`Steps` report addressable slots per draw, lean lookups that fell
   back, table bytes, pushes and descriptor writes saved; the `DrawRun` line reports the fast lane's
   draws and its verify checks and mismatches.

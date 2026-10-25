@@ -67,6 +67,9 @@ void NoteGuestWriteStream(uint64_t address, uint64_t size);
 [[nodiscard]] bool BdaWritesEnabled();
 // KYTY_BDA_WRITES=verify: dropped writes and written pages under a GPU-modified image are fatal.
 [[nodiscard]] bool BdaWritesVerify();
+// KYTY_BDA_SYNC_ALL_DRAWS=1 (diagnostic, live): every graphics draw runs the BDA synchronization
+// pass before its bindings, as a draw with address-read buffers would (draw-run-address-commit D0).
+[[nodiscard]] bool BdaSyncAllDraws();
 
 struct BufferContentRevision {
 	BufferId id;

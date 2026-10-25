@@ -2420,7 +2420,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_bvh |= stage->runtime->program->info.uses_bvh;
 	}
 	CommitStats::StepMark(CommitStats::Step::FindBuffers);
-	if (uses_dma) {
+	// KYTY_BDA_SYNC_ALL_DRAWS (bufferCache.h): the pass under every draw, for the measurement gate.
+	if (uses_dma || BdaSyncAllDraws()) {
 		const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::PrepareBda);
 		m_context.PrepareBda();
 	}

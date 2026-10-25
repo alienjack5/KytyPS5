@@ -99,6 +99,9 @@ double Median(std::vector<double> values) {
 struct LiveCounters {
 	std::atomic<uint64_t> bda_passes[4] {};
 	std::atomic<uint64_t> bda_bytes[4] {};
+	std::atomic<uint64_t> bda_calls {0};
+	std::atomic<uint64_t> bda_skips {0};
+	std::atomic<uint64_t> bda_pass_ns {0};
 	std::atomic<uint64_t> faults {0};
 	std::atomic<uint64_t> fault_ns {0};
 	std::atomic<uint64_t> protect_calls {0};
@@ -113,6 +116,7 @@ LiveCounters g_live;
 struct LiveSnapshot {
 	uint64_t bda_passes[4] {};
 	uint64_t bda_bytes[4] {};
+	uint64_t bda_calls = 0, bda_skips = 0, bda_pass_ns = 0;
 	uint64_t faults = 0, fault_ns = 0;
 	uint64_t protect_calls = 0, protect_pages = 0, protect_ns = 0;
 	uint64_t unprotect_calls = 0, unprotect_pages = 0, unprotect_ns = 0;
@@ -125,6 +129,9 @@ LiveSnapshot TakeLive(uint64_t frames, uint64_t now) {
 		s.bda_passes[i] = g_live.bda_passes[i].load(std::memory_order_relaxed);
 		s.bda_bytes[i]  = g_live.bda_bytes[i].load(std::memory_order_relaxed);
 	}
+	s.bda_calls       = g_live.bda_calls.load(std::memory_order_relaxed);
+	s.bda_skips       = g_live.bda_skips.load(std::memory_order_relaxed);
+	s.bda_pass_ns     = g_live.bda_pass_ns.load(std::memory_order_relaxed);
 	s.faults          = g_live.faults.load(std::memory_order_relaxed);
 	s.fault_ns        = g_live.fault_ns.load(std::memory_order_relaxed);
 	s.protect_calls   = g_live.protect_calls.load(std::memory_order_relaxed);
@@ -1074,6 +1081,15 @@ void NoteBdaPass(int kind, uint64_t bytes) noexcept {
 	}
 }
 
+void NoteBdaCall(bool skipped, uint64_t pass_ns) noexcept {
+	g_live.bda_calls.fetch_add(1, std::memory_order_relaxed);
+	if (skipped) {
+		g_live.bda_skips.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_live.bda_pass_ns.fetch_add(pass_ns, std::memory_order_relaxed);
+	}
+}
+
 void NoteProtect(bool unprotect, uint64_t pages, uint64_t ns) noexcept {
 	if (unprotect) {
 		g_live.unprotect_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1153,14 +1169,17 @@ void AdvanceFrame() noexcept {
 		{
 			const auto f = static_cast<double>(frames);
 			std::printf("Kyty BDA passes: last %.0f s, per frame: idle %.1f, hot runs %.1f (%.2f MB), dirty log %.1f "
-			            "(%.2f MB), full scan %.2f (%.2f MB)\n",
+			            "(%.2f MB), full scan %.2f (%.2f MB); %.1f calls, %.1f gate skips, %.3f ms in passes\n",
 			            seconds, static_cast<double>(c.bda_passes[0] - p.bda_passes[0]) / f,
 			            static_cast<double>(c.bda_passes[1] - p.bda_passes[1]) / f,
 			            static_cast<double>(c.bda_bytes[1] - p.bda_bytes[1]) / f / 1e6,
 			            static_cast<double>(c.bda_passes[2] - p.bda_passes[2]) / f,
 			            static_cast<double>(c.bda_bytes[2] - p.bda_bytes[2]) / f / 1e6,
 			            static_cast<double>(c.bda_passes[3] - p.bda_passes[3]) / f,
-			            static_cast<double>(c.bda_bytes[3] - p.bda_bytes[3]) / f / 1e6);
+			            static_cast<double>(c.bda_bytes[3] - p.bda_bytes[3]) / f / 1e6,
+			            static_cast<double>(c.bda_calls - p.bda_calls) / f,
+			            static_cast<double>(c.bda_skips - p.bda_skips) / f,
+			            static_cast<double>(c.bda_pass_ns - p.bda_pass_ns) / f / 1e6);
 		}
 		std::printf("Kyty fault cost: last %.0f s, %.1f fps: %.0f faults/frame at %.1f us in the handler "
 		            "(%.2f ms/frame); protect %.0f calls/frame at %.1f us (%.0f pages/call); unprotect %.0f "

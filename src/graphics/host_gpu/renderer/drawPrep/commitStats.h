@@ -104,6 +104,7 @@ enum class Item : uint8_t {
 	CertRanges,     // and the certificate's ranges
 	// KYTY_DRAW_RUN_BINDINGS (drawRun.h): what a continuation reused from its run.
 	RunBindingsReused,    // V#, vertex-range and index bindings taken from the run's resolutions
+	AddressSlots,         // V# slots delivered as address entries, no descriptor (KYTY_BUFFERS_BY_ADDRESS)
 	RunBindingsFallback,  // reuse refused at commit (the buffer structure epoch moved since)
 	Count
 };

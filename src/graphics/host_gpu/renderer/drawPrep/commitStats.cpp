@@ -231,7 +231,8 @@ const char* const kItemNames[ItemCount] = {
     "textures",  "samplers",   "set-current", "set-history",   "set-miss",
     "set-repeated", "color-hit", "color-miss", "depth-hit",    "depth-miss",
     "target-repeat", "target-lookup", "descwrites", "transitions", "pipeline-new",
-    "read-hits",  "read-misses", "log-entries", "cert-ranges", "run-reused", "run-fallback"};
+    "read-hits",  "read-misses", "log-entries", "cert-ranges", "run-reused", "addr-slots",
+    "run-fallback"};
 
 const char* const kStepNames[StepCount] = {
     "g.committail", "g.retire",      "g.opexit",     "g.loop",        "g.ophead",      "g.drawop",

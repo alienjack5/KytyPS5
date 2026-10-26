@@ -684,6 +684,9 @@ void Write(CodecWriter& w, const BindingLayout& v) {
 	w.U32(v.mip_stats_count);
 	w.Words(v.user_data_registers);
 	WriteVector(w, v.descriptors);
+	// KYTY_BUFFERS_BY_ADDRESS (draw-run-address-commit): the addressable slots and the table pointer.
+	w.Words(v.address_buffers);
+	w.U32(v.table_pointer_dword);
 }
 
 void Read(CodecReader& r, BindingLayout& v) {
@@ -694,6 +697,8 @@ void Read(CodecReader& r, BindingLayout& v) {
 	v.mip_stats_count       = r.U32();
 	v.user_data_registers   = r.Words();
 	ReadVector(r, v.descriptors);
+	v.address_buffers       = r.Words();
+	v.table_pointer_dword   = r.U32();
 }
 
 void Write(CodecWriter& w, const WriteRangeProgram& v) {

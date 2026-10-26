@@ -218,13 +218,17 @@ needs the owner's handle and offset, not a device address, and the bind is encod
 owner or offset changed since the previous draw of the run (the archived change found identical
 binds cost 0.01 µs to re-encode; the saving here is the resolution, not the bind).
 
-**Variant B (chosen)**: steps 1–3 as above for the *identity* of the buffer (a continuation whose
-range lies inside the recorded owner skips the lookup and the memo), but a range not served from
-the record goes through `ObtainReadBinding`'s memo and `ObtainBufferNow` as today, so CPU-dirty
-bytes are copied per binding as now; D1's descriptor side is unchanged. Expected from the step
-table: descriptors and push 0.52 → ≈ 0.15, `rbbindings` 0.66 → ≈ 0.5 (no `StorageDescriptor`
-build, record-owner hits for ring advances), vertex/index ≈ unchanged; with D3 the control, post
-and gap groups 2.2 → ≈ 1.1: a continuation of about 3.0 µs.
+**Variant B (chosen)**: per-binding synchronization stays, so the owner lookup of steps 1–2 cannot
+serve a range *inside* the recorded owner that differs from the recorded range: its bytes are new
+CPU writes (a ring advancing) that only the memo path uploads. A continuation therefore reuses a
+resolution exactly as `KYTY_DRAW_RUN_BINDINGS` does today (the exact recorded range, D1 of the
+archived change) and every other range goes through `ObtainReadBinding`'s memo and
+`ObtainBufferNow`; the owner lookup is not built in this variant. What changes is the delivery:
+the resolution becomes an address entry instead of a descriptor (D1), for both the reused and the
+freshly resolved slot. Expected from the step
+table: descriptors and push 0.52 → ≈ 0.15, `rbbindings` 0.66 → ≈ 0.6 (no `StorageDescriptor`
+build), vertex/index unchanged; with D3 the control, post and gap groups 2.2 → ≈ 1.1: a
+continuation of about 3.0–3.2 µs.
 
 *Why the owner is sound where `FindBuffer` was not*: the dropped hint path reused *a* buffer that
 covered the range while another registered buffer could cover it too and hold the GPU-written

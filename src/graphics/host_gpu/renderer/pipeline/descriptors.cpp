@@ -2147,6 +2147,23 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffer_resolutions.resize(program.info.buffers.size());
 	const auto* uniform_binding = ShaderRecompiler::IR::FindBinding(
 	    program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UniformBuffers);
+	// KYTY_BUFFERS_BY_ADDRESS (IR::BindingLayout::address_buffers): an addressable slot's resolution
+	// goes into its address entry of the shader data (device address low and high, size in bytes,
+	// flags 0) instead of a descriptor element; the entry address is the exact guest base, so the
+	// slot's memory-offset byte stays 0. The slots ascend, as the entries do.
+	uint32_t   address_index       = 0;
+	const auto write_address_entry = [&](const BufferResolution& resolution, uint64_t size) {
+		const auto dword   = layout.AddressEntryDword(address_index++);
+		const auto address = resolution.buffer != nullptr && size != 0
+		                         ? resolution.buffer->BufferDeviceAddress() + resolution.offset
+		                         : uint64_t {0};
+		EXIT_IF(address == 0 && resolution.buffer != nullptr && size != 0);
+		prepared.shader_data[dword]      = static_cast<uint32_t>(address);
+		prepared.shader_data[dword + 1u] = static_cast<uint32_t>(address >> 32u);
+		prepared.shader_data[dword + 2u] = static_cast<uint32_t>(address != 0 ? size : 0);
+		prepared.shader_data[dword + 3u] = 0;
+		CommitStats::AddItems(CommitStats::Item::AddressSlots, 1);
+	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t    buffer_offset = 0;
 		const auto& resource      = program.info.buffers[i];
@@ -2154,6 +2171,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		auto&       resolved      = prepared.buffer_resolutions[i];
 		const bool  uniform_view  = uniform_binding != nullptr &&
 		                           std::ranges::binary_search(uniform_binding->resources, i);
+		const bool  by_address    = std::ranges::binary_search(layout.address_buffers, i);
 		const DrawRunBufferBinding* reuse = nullptr;
 		if (recorded != nullptr && !resource.written && !resource.formatted && source.address != 0 &&
 		    source.size != 0) {
@@ -2166,6 +2184,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			    StorageAlignment(m_context.GetGraphics(), uniform_view), buffer_offset));
 			DrawRun::GetTotals().bindings_reused.fetch_add(1, std::memory_order_relaxed);
 			CommitStats::AddItems(CommitStats::Item::RunBindingsReused, 1);
+			if (by_address) {
+				write_address_entry(resolved, source.size);
+				buffer_offset = 0;
+			}
 			pack_memory_offset(i, buffer_offset);
 			continue;
 		}
@@ -2181,8 +2203,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (reuse != nullptr) {
 			DrawRunVerifyBinding(*reuse, resolved.buffer, resolved.offset, "buffer binding");
 		}
+		if (by_address) {
+			write_address_entry(resolved, source.size);
+			buffer_offset = 0;
+		}
 		pack_memory_offset(i, buffer_offset);
 	}
+	EXIT_IF(address_index != layout.address_buffers.size());
 	CommitStats::StepMark(CommitStats::Step::RbBindings);
 	prepared.mip_stats_canary = false;
 	BufferLookupStats::PartScope mip_scope(BufferLookupStats::Part::MipStats);
@@ -2201,7 +2228,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site, &fresh);
 		prepared.fresh_upload |= fresh;
 	}
-	if (ShaderRecompiler::IR::FindBinding(
+	// The ShaderData descriptor, or the block the table pointer reaches (KYTY_BUFFERS_BY_ADDRESS).
+	if (layout.UsesTablePointer() ||
+	    ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
 		bool fresh                  = false;
 		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data, site + 1u, &fresh);
@@ -2933,6 +2962,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
+			has_push_data = true;
+		} else if (program.bindings.UsesTablePointer()) {
+			// KYTY_BUFFERS_BY_ADDRESS: the device address of the uploaded shader data (a stream-ring
+			// allocation, NativeUpload) in the two pointer dwords.
+			const auto& ring = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			EXIT_IF(prepared->shader_data_buffer.buffer != ring.Handle());
+			const auto address = ring.BufferDeviceAddress() + prepared->shader_data_buffer.offset;
+			EXIT_IF(address == 0);
+			push_data.dwords[program.bindings.table_pointer_dword]      = static_cast<uint32_t>(address);
+			push_data.dwords[program.bindings.table_pointer_dword + 1u] = static_cast<uint32_t>(address >> 32u);
 			has_push_data = true;
 		}
 		CommitStats::StepMark(CommitStats::Step::CbBuild);

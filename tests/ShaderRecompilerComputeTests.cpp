@@ -2435,22 +2435,38 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  if (compute_info.lds_storage) {
-    // KYTY_LDS_DEVICE_BUFFER: the case's workgroup-memory expectations do not apply.
-    auto storage = test;
-    std::erase_if(storage.required_spirv, [](const std::string &text) {
-      return text.find("Workgroup") != std::string::npos;
-    });
-    CheckSpirvEmission(storage, result.spirv);
-  } else {
-    CheckSpirvEmission(test, result.spirv);
+  {
+    auto expectations = test;
+    if (compute_info.lds_storage) {
+      // KYTY_LDS_DEVICE_BUFFER: the case's workgroup-memory expectations do not apply.
+      std::erase_if(expectations.required_spirv, [](const std::string &text) {
+        return text.find("Workgroup") != std::string::npos;
+      });
+    }
+    if (!result.program.bindings.address_buffers.empty() ||
+        result.program.bindings.UsesTablePointer()) {
+      // KYTY_BUFFERS_BY_ADDRESS: the cases' SPIR-V text expectations describe the descriptor
+      // codegen (storage-buffer access chains, OpArrayLength bounds, no 64-bit integers); a
+      // program read through 64-bit physical pointers meets none of them by construction. The
+      // by-address run keeps the validation and the readback comparisons, which are the result.
+      expectations.required_spirv.clear();
+      expectations.forbidden_spirv.clear();
+    }
+    CheckSpirvEmission(expectations, result.spirv);
   }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
-    Require(test.name, "live buffer bindings",
-            buffer_binding != nullptr &&
-                buffer_binding->resources == *test.expected_buffer_resources,
+    // The surviving slots: the Buffers group plus, with KYTY_BUFFERS_BY_ADDRESS, the addressable
+    // ones (both ascending, so their merge is the order the case expects).
+    std::vector<u32> surviving;
+    if (buffer_binding != nullptr) {
+      surviving = buffer_binding->resources;
+    }
+    surviving.insert(surviving.end(), result.program.bindings.address_buffers.begin(),
+                     result.program.bindings.address_buffers.end());
+    std::sort(surviving.begin(), surviving.end());
+    Require(test.name, "live buffer bindings", surviving == *test.expected_buffer_resources,
             "dead buffer changed the surviving descriptor order");
   }
   std::vector<u32> packed_user_data;
@@ -2459,17 +2475,20 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count = result.program.bindings.memory_offset_count;
-  for (u32 i = 0; i < buffer_count; i++) {
-    u32 offset = 0;
-    const auto resource = buffer_binding->resources[i];
-    if (resource < test.storage_buffer_offsets.size()) {
-      offset = test.storage_buffer_offsets[resource];
+  // The memory offsets of the descriptor-bound slots, at each slot's position. An addressable slot
+  // (KYTY_BUFFERS_BY_ADDRESS) keeps 0: its entry address is the exact base (Dispatch writes the
+  // entries once the buffer exists).
+  if (buffer_binding != nullptr) {
+    for (const auto resource : buffer_binding->resources) {
+      u32 offset = 0;
+      if (resource < test.storage_buffer_offsets.size()) {
+        offset = test.storage_buffer_offsets[resource];
+      }
+      Require(test.name, "shader data", offset < 256,
+              "storage buffer offset is not representable");
+      packed_user_data[result.program.bindings.memory_offset_dword + resource / 4u] |=
+          offset << ((resource % 4u) * 8u);
     }
-    Require(test.name, "shader data", offset < 256,
-            "storage buffer offset is not representable");
-    packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
-        offset << ((i % 4u) * 8u);
   }
   CompiledShader compiled{std::move(result.spirv), std::move(result.program),
                           std::move(resources), std::move(packed_user_data)};
@@ -27609,9 +27628,11 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // device_address: every storage buffer gets one (KYTY_BUFFERS_BY_ADDRESS reads the case buffer
+  // and the shader data block through device addresses).
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
-                             size_t dword_count, bool device_address = false) {
+                             size_t dword_count, bool device_address = true) {
     Buffer ret;
     ret.size = static_cast<vk::DeviceSize>(std::max<size_t>(dword_count, 1u) *
                                            sizeof(u32));
@@ -28020,7 +28041,7 @@ public:
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
     vk::PushConstantRange push_range{};
-    if (layout.UsesPushData()) {
+    if (layout.UsesPushData() || layout.UsesTablePointer()) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
       push_range.offset = 0;
       push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
@@ -28166,6 +28187,40 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
+    // KYTY_BUFFERS_BY_ADDRESS: the addressable slots' entries (device address and size) in the
+    // shader data, with the view each slot's descriptor would have had: the exact base is the
+    // view's offset plus the slot's base adjustment, the size what remains of the view after it.
+    if (!layout.address_buffers.empty()) {
+      Require(test.name, "dispatch", buffer.device_address != 0,
+              "addressable buffer slots need a case buffer with a device address");
+      for (u32 k = 0; k < layout.address_buffers.size(); k++) {
+        const auto resource = layout.address_buffers[k];
+        uint64_t view_offset = 0;
+        uint64_t view_size = buffer.size;
+        const uint64_t adjustment = resource < test.storage_buffer_offsets.size()
+                                   ? test.storage_buffer_offsets[resource]
+                                   : 0u;
+        if (resource < test.storage_buffer_ranges.size()) {
+          const auto [offset, size] = test.storage_buffer_ranges[resource];
+          view_offset = offset;
+          view_size = size;
+        } else if (test.storage_buffer_range_dwords != 0 || test.storage_buffer_range_bytes != 0) {
+          const auto range = test.storage_buffer_range_bytes != 0
+                                 ? test.storage_buffer_range_bytes
+                                 : test.storage_buffer_range_dwords * sizeof(u32);
+          view_size = range + adjustment;
+        }
+        Require(test.name, "dispatch",
+                adjustment <= view_size && view_offset + view_size <= buffer.size,
+                "addressable buffer view exceeds its backing buffer");
+        const auto address = buffer.device_address + view_offset + adjustment;
+        const auto dword = layout.AddressEntryDword(k);
+        shader_data[dword] = static_cast<u32>(address);
+        shader_data[dword + 1u] = static_cast<u32>(address >> 32u);
+        shader_data[dword + 2u] = static_cast<u32>(view_size - adjustment);
+        shader_data[dword + 3u] = 0;
+      }
+    }
     if (const auto *flattened = Binding(Kind::FlattenedSrt);
         flattened != nullptr) {
       flattened_buffer =
@@ -28181,18 +28236,22 @@ public:
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
-    if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
+    if (const auto *user = Binding(Kind::ShaderData);
+        user != nullptr || layout.UsesTablePointer()) {
+      // The ShaderData descriptor, or the block the table pointer reaches (KYTY_BUFFERS_BY_ADDRESS).
       user_data_buffer =
           CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
-      vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
-      write.dstSet = descriptor_set;
-      write.dstBinding = Native(Kind::ShaderData);
-      write.descriptorCount = 1;
-      write.descriptorType = vk::DescriptorType::eStorageBuffer;
-      write.pBufferInfo = &user_data_info;
-      writes.push_back(write);
+      if (user != nullptr) {
+        vk::WriteDescriptorSet write{};
+        write.sType = vk::StructureType::eWriteDescriptorSet;
+        write.dstSet = descriptor_set;
+        write.dstBinding = Native(Kind::ShaderData);
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = &user_data_info;
+        writes.push_back(write);
+      }
     }
     if (const auto *lds = Binding(Kind::SharedMemory); lds != nullptr) {
       // KYTY_LDS_DEVICE_BUFFER: one region per workgroup of the dispatch, as the renderer binds.
@@ -28400,10 +28459,21 @@ public:
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
-    if (layout.UsesPushData()) {
+    if (layout.UsesPushData() || layout.UsesTablePointer()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(shader_data.begin(), shader_data.end(),
-                push_data.dwords.begin() + layout.push_data_start_dword);
+      if (layout.UsesPushData()) {
+        std::copy(shader_data.begin(), shader_data.end(),
+                  push_data.dwords.begin() + layout.push_data_start_dword);
+      }
+      if (layout.UsesTablePointer()) {
+        // KYTY_BUFFERS_BY_ADDRESS: the shader data block's device address in the pointer dwords.
+        Require(test.name, "dispatch", user_data_buffer.device_address != 0,
+                "the shader data block needs a device address for its table pointer");
+        push_data.dwords[layout.table_pointer_dword] =
+            static_cast<u32>(user_data_buffer.device_address);
+        push_data.dwords[layout.table_pointer_dword + 1u] =
+            static_cast<u32>(user_data_buffer.device_address >> 32u);
+      }
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
@@ -33050,7 +33120,9 @@ private:
     vk::BufferCreateInfo buffer_info{};
     buffer_info.sType = vk::StructureType::eBufferCreateInfo;
     buffer_info.size = size;
-    buffer_info.usage = usage;
+    // Every harness buffer carries a device address (KYTY_BUFFERS_BY_ADDRESS reads case buffers
+    // through them).
+    buffer_info.usage = usage | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     buffer_info.sharingMode = vk::SharingMode::eExclusive;
     RequireVk(shader_name, "dispatch",
               m_device.createBuffer(&buffer_info, nullptr, &ret.buffer),
@@ -33069,12 +33141,20 @@ private:
     allocation.sType = vk::StructureType::eMemoryAllocateInfo;
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = memory_type;
+    vk::MemoryAllocateFlagsInfo address_flags{};
+    address_flags.sType = vk::StructureType::eMemoryAllocateFlagsInfo;
+    address_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    allocation.pNext = &address_flags;
     RequireVk(shader_name, "dispatch",
               m_device.allocateMemory(&allocation, nullptr, &ret.memory),
               "vkAllocateMemory");
     RequireVk(shader_name, "dispatch",
               m_device.bindBufferMemory(ret.buffer, ret.memory, 0),
               "vkBindBufferMemory");
+    vk::BufferDeviceAddressInfo address_info{};
+    address_info.sType = vk::StructureType::eBufferDeviceAddressInfo;
+    address_info.buffer = ret.buffer;
+    ret.device_address = m_device.getBufferAddress(address_info);
     return ret;
   }
 
@@ -33100,7 +33180,9 @@ private:
     vk::BufferCreateInfo buffer_info{};
     buffer_info.sType = vk::StructureType::eBufferCreateInfo;
     buffer_info.size = ret.size;
-    buffer_info.usage = usage;
+    // Every harness buffer carries a device address (KYTY_BUFFERS_BY_ADDRESS reads case buffers
+    // through them).
+    buffer_info.usage = usage | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     buffer_info.sharingMode = vk::SharingMode::eExclusive;
     RequireVk(shader_name, "dispatch",
               m_device.createBuffer(&buffer_info, nullptr, &ret.buffer),
@@ -33125,12 +33207,20 @@ private:
     alloc.sType = vk::StructureType::eMemoryAllocateInfo;
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = memory_type;
+    vk::MemoryAllocateFlagsInfo address_flags{};
+    address_flags.sType = vk::StructureType::eMemoryAllocateFlagsInfo;
+    address_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    alloc.pNext = &address_flags;
     RequireVk(shader_name, "dispatch",
               m_device.allocateMemory(&alloc, nullptr, &ret.memory),
               "vkAllocateMemory");
     RequireVk(shader_name, "dispatch",
               m_device.bindBufferMemory(ret.buffer, ret.memory, 0),
               "vkBindBufferMemory");
+    vk::BufferDeviceAddressInfo address_info{};
+    address_info.sType = vk::StructureType::eBufferDeviceAddressInfo;
+    address_info.buffer = ret.buffer;
+    ret.device_address = m_device.getBufferAddress(address_info);
     if (!contents.empty()) {
       WriteBuffer(shader_name, ret, contents);
     }
@@ -33263,8 +33353,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   };
   const auto dwords = std::max<size_t>(
       {test.initial.size(), test.expected.size(), static_cast<size_t>(1)});
-  auto buffer = vulkan->CreateStorageBuffer(
-      test.name, test.initial, dwords, Has(Kind::BdaPagetable));
+  // A device address always: the BDA page-table cases and KYTY_BUFFERS_BY_ADDRESS read it.
+  auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, dwords, true);
   VulkanHarness::Image sampled_image;
   VulkanHarness::Image storage_image;
   VulkanHarness::Image storage_image_uint;

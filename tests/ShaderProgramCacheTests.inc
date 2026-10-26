@@ -237,29 +237,22 @@ void CheckFingerprint() {
   {
     // The uniform option is part of the identity only with buffers_by_address on: a cache written
     // with it off and the uniform flag flipped stays valid (the flag changes nothing then).
+    // Explicit references, so the check holds whatever KYTY_BUFFERS_BY_ADDRESS the run has.
     auto options = GetCodegenOptions();
-    options.buffers_by_address = true;
-    options.buffers_by_address_uniform = false;
-    std::vector<uint8_t> by_address;
-    {
+    const auto fingerprint_with = [&](bool by_address, bool uniform) {
+      options.buffers_by_address = by_address;
+      options.buffers_by_address_uniform = uniform;
       ScopedCodegenOptions scope(options);
-      by_address = ShaderRecompiler::CodegenFingerprint();
-    }
-    options.buffers_by_address_uniform = true;
-    {
-      ScopedCodegenOptions scope(options);
-      Require(name, "buffers_by_address_uniform", ShaderRecompiler::CodegenFingerprint() != by_address,
-              "the fingerprint does not depend on CodegenOptions::buffers_by_address_uniform with "
-              "buffers_by_address on");
-    }
-    options.buffers_by_address = false;
-    {
-      ScopedCodegenOptions scope(options);
-      Require(name, "buffers_by_address_uniform off",
-              ShaderRecompiler::CodegenFingerprint() == base,
-              "the fingerprint depends on CodegenOptions::buffers_by_address_uniform with "
-              "buffers_by_address off");
-    }
+      return ShaderRecompiler::CodegenFingerprint();
+    };
+    Require(name, "buffers_by_address_uniform",
+            fingerprint_with(true, true) != fingerprint_with(true, false),
+            "the fingerprint does not depend on CodegenOptions::buffers_by_address_uniform with "
+            "buffers_by_address on");
+    Require(name, "buffers_by_address_uniform off",
+            fingerprint_with(false, true) == fingerprint_with(false, false),
+            "the fingerprint depends on CodegenOptions::buffers_by_address_uniform with "
+            "buffers_by_address off");
   }
 
   // Host state the emitter reads.

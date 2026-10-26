@@ -36,7 +36,7 @@
 
 ## 5. Measurement and acceptance (D6)
 
-- [ ] 5.1 ASTRO's PLAYROOM, same area, 3–5 min, measuring preset + the switches; compare with `_console-20261025-190222.txt`: `cont` commit + gap, resolver ms/frame, fps p50, GPU busy, lane share, addressable share; the acceptance numbers of D6 by variant
+- [ ] 5.1 Partial 2026-10-25 for D1 (see design D1 measured): by address alone neutral (0.2 slots/draw); with the uniform option CP ≈ 0, GPU +8 points, frame per draw +7% stats off → `KYTY_BUFFERS_BY_ADDRESS` stays off and out of the preset. Remaining for D3. Original: ASTRO's PLAYROOM, same area, 3–5 min, measuring preset + the switches; compare with `_console-20261025-190222.txt`: `cont` commit + gap, resolver ms/frame, fps p50, GPU busy, lane share, addressable share; the acceptance numbers of D6 by variant
 - [ ] 5.2 The same run without `KYTY_CP_COMMIT_STATS` (fps and CP busy from the hang trace)
 - [ ] 5.3 `KYTY_BUFFERS_BY_ADDRESS=exit`, `KYTY_DRAW_RUN_BINDINGS=exit` and (see 3.4) `KYTY_DRAW_RUN=exit` runs of 5 min each
 - [ ] 5.4 God of War Sons of Sparta regression with every switch on (`kyty_run_check.sh ~/Games/ps5/PPSA28997`, verify modes): 60 fps, 0 mismatches

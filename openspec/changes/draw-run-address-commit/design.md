@@ -236,6 +236,24 @@ bytes; the page-table owner is unique per page and is what the BDA page table on
 to, so an address read through it reads what the computed-V# path already reads. A range that
 straddles two owners is exactly the case `ObtainBuffer`'s join exists for, and it takes that path.
 
+**D1 measured in-game (2026-10-25, ASTRO's PLAYROOM, `_console-20261025-2231xx/2233xx.txt`)**: with the
+default classification only 0.2 slots per continuation are addressable (the per-draw constants are
+uniform views under int21's `KYTY_UNIFORM_BUFFERS=1`), so the run is neutral (5.85 vs 5.84 µs of
+frame per draw, stats off). With `KYTY_BUFFERS_BY_ADDRESS_UNIFORM=1`: 1.85 addressable slots per
+continuation, descriptor writes 3.85 → 2.31 per draw, `descbuild` + `descpush` −0.07 µs, but the
+four-dword entries push the shader data past the push range, so the block goes through the table
+pointer with a stream-ring upload per draw: `rbtables` + `cbpushconst` +0.07 µs. CP balance ≈ 0;
+GPU busy 43 → 51% in the heavy windows (constant cache lost); frame per draw 5.84 → 6.23 µs stats
+off. **Decision: the switch stays off and out of the preset.** The descriptor leg of this design
+rested on a wrong attribution: `CommitBindings` costs ~0.39 µs per continuation of which the
+per-write part is ~45 ns each; the structure, not the writes, is the cost. The code stays (tested,
+default off; a later variant A or the fast lane could use a per-draw table).
+
+**Measurement base correction**: a stats-off draw costs ~5.85 µs of frame time while the `steps`
+runs show ~7.7, so the instrumentation is ~1.9 µs per draw and a continuation costs about 2.7 µs
+without it, not 4.6. D3's expected gain must be re-estimated stats off (first: fps with
+`KYTY_DRAW_RUN=0`, to see what the current continuation already saves).
+
 ### D3. The continuation fast lane
 
 With `KYTY_DRAW_RUN_FAST=1`, `DrawIndex`/`DrawAuto` route a draw whose `DrawRunCandidate` accepted

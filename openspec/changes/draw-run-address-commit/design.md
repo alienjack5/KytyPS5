@@ -289,6 +289,40 @@ change's D3 trimmed three of them and gained nothing); a lane that starts from "
 adds the six things above has a floor near the sum of those six (≈ 0.45 + 0.3 + 0.2 + 0.15 + 0.15
 + 0.1 ≈ 1.4 µs plus the gap). The generic path stays the reference and the fallback.
 
+**D3 re-examined (2026-10-26, commit map + `perf` without instrumentation)**: the structure key
+already pins every context register, the programs and the T#/S# words; what it does not pin (V#s,
+user data, the flattened SRT, the draw arguments, the index type) is exactly the per-draw work.
+Of the generic path's segments, a continuation today already skips images, acquisition, transitions,
+dynamic state and the MRT pass; what the lane could still skip (target operations, vertex-shader and
+hardware checks, the mesh/indirect/prefetch head, pipeline selection and barrier classification if
+the record stored them) is register reads of tens of nanoseconds each, none visible in the profile.
+The resolver's self time (heavy scene, 22–29 fps): buffer resolution ≈ 26% (`RebindBuffers` 5.5,
+`SynchronizeBuffer` 3.8, `ObtainReadBindingMemo` 2.9, `FindBuffers` 2.5, `AcquireVertexBuffersInto`
+2.1, tracker queries ≈ 4), command-stream encoding ≈ 12% (`Encoder::Open` 4.6, `Close` 1.9,
+`Reserve` 1.0, `memmove` 4.4), draw control ≈ 22% spread over ten functions (`ExecutePreparedDraw`
+self 6.3, `PrepareDrawRenderState` 2.9, engine commit/head 5.1, certificate 2.8), `CommitBindings`
+3.6 + `memcmp` 1.7, locks ≈ 4%. **The lane as designed (a second function that skips control steps)
+cannot pay for itself: its skippable part is below 1% of the thread.** The 2026-10-18 step costs it was
+sized from were ~1.9 µs of instrumentation per draw. D3 is suspended until a caller-resolved profile
+(LBR) attributes `memmove`, `Encoder::Open`, the locks and the synchronization to their callers; the
+candidates it must decide between are fewer stream ops per continuation (one packet for push,
+descriptors, binds and draw), the per-buffer synchronization query of unchanged slots, and the
+register/bindings copies. Note for the preset: `KYTY_GPU_OP_PROFILE` adds a site block to every
+barrier packet (`barrier_sites`) and to every packet during a capture.
+
+**Caller-resolved profile (2026-10-26 21:57, LBR; files `_perf-20261026-215658-*` in the install
+directory, details in `PROGRESS.md`)**: of the resolver thread, buffer resolution is 26% inclusive and
+most of its unexplained part is the texel (formatted) slots: `NativeStorageBuffer` sends them to
+`ObtainBufferNow` without the read memo, `SynchronizeBuffer` skips its relaxed fast path for texel reads
+and walks the tracker under locks plus an image lookup under the texture-cache lock on every draw, and
+the run-bindings reuse excludes them (`!resource.formatted`); ≈ 9–10% of the thread. A single seq_cst
+store in `DrawPrep::Window::Retire` is 1.9% (cache line shared with the spinning workers), the
+recorder kick 1.0%, per-draw state copies (`ApplyPreparedDraw`, record refresh, push data) ≈ 5%,
+diagnostic gates ≈ 1–3%, encoding ≈ 6%. The next work is a diagnostic run (`KYTY_BUFFER_LOOKUP_STATS=1
+KYTY_BINDING_MEMO_STATS=1`), then the cheap experiments (`-DKYTY_CP_DIAGNOSTICS=OFF` build; spin
+backoff and cache-line separation), then a proposal for texel slots in continuations. D3 as written
+stays suspended.
+
 ### D4. Switches, modes and the record
 
 `KYTY_BUFFERS_BY_ADDRESS` (0 / 1; `verify` and `exit` apply to the host side: the lean resolution

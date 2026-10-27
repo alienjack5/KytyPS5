@@ -23,7 +23,7 @@
 - [ ] 2.5 Verify mode for the host side (`KYTY_BUFFERS_BY_ADDRESS=verify|exit`): the lean resolution also runs `ObtainBuffer` and compares owner and offset through `DrawRun::ReportMismatch` (part "address"); verify with an injected mismatch in a unit case that the count and the exit happen
 - [ ] 2.6 Vertex and index ranges through the lean resolution (`AcquireVertexBuffersInto`, `PrepareIndexBuffer`), binds encoded only when owner or offset changed; verify with an indexed-draw engine case that repeats a vertex buffer across a run (the archived change's pending unit test) and with the verify mode
 
-## 3. The continuation fast lane (D3)
+## 3. The continuation fast lane (D3) — suspended 2026-10-26 (design D3 re-examined): the skippable control is < 1% of the resolver; next is the LBR profile and the per-draw-work candidates
 
 - [ ] 3.1 Add `Live::Switch` `KYTY_DRAW_RUN_FAST` and the record's mode field; route accepted continuations from `DrawIndex`/`DrawAuto` to `RenderExecutor::ExecuteRunContinuation`: late check, `DrawPrep::Validate` + plan activation, per-draw data (2.1/2.6), binds when changed, draw command with post-draw hooks, run record; fallback to `ExecutePreparedDraw` on a failed late check (`latefallback`); verify with `draw_prep_tests` that a run of N draws commits N−1 through the lane and that a mid-run image change falls back
 - [ ] 3.2 Extend `KYTY_DRAW_RUN=verify` for lane draws: recompute on scratch state and compare plan activation outcome, primitive-restart/index-size decision, barrier classification and the descriptor write list; verify with an injected difference per item in a unit case
